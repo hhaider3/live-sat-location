@@ -68,7 +68,7 @@ npm run preview
 
 ## Data and Orbit Model
 
-Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
+Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format through a same-origin Cloudflare Worker endpoint. Successful responses are cached at the edge for two hours to respect CelesTrak's update schedule and prevent every visitor from downloading the same data directly. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
 
 When a group cannot be fetched or parsed within the request timeout, the app creates a synthetic circular-orbit approximation for that group. Simulated groups are marked with `sim` in the constellation panel and are included in the `Mixed` or `Offline` status rather than being presented as live data.
 
@@ -90,6 +90,9 @@ src/
 ├── satellites.ts   # TLE loading, SGP4 propagation, and simulated fallbacks
 ├── index.css       # Tailwind CSS entry point
 └── main.tsx        # React application entry point
+worker/
+└── index.js        # Cached, same-origin proxy for CelesTrak TLE data
+wrangler.jsonc      # Cloudflare Worker and static-assets configuration
 ```
 
 ## Accuracy Notice

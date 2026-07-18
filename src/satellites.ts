@@ -119,7 +119,7 @@ const fallbackOther = (): Sat[] => [
 // ---------- Group catalogue ----------
 
 const CT = (group: string) =>
-  `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`;
+  `/api/tle?group=${encodeURIComponent(group)}`;
 
 export const GROUP_DEFS: GroupDef[] = [
   { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), fallback: fallbackStarlink },
