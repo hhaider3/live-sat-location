@@ -4,6 +4,8 @@ An interactive 3D visualization of Earth-orbiting satellites, built with React, 
 
 The visualization runs entirely in the browser and requires no backend.
 
+**Live demo:** [live-sat-location.hasanhaider009.workers.dev](https://live-sat-location.hasanhaider009.workers.dev/)
+
 ## Features
 
 - Interactive 3D Earth with atmosphere, stars, sunlight, and a readable night side
@@ -64,17 +66,6 @@ Preview the production build locally with:
 npm run preview
 ```
 
-## Deploying to GitHub Pages
-
-This project is a static site. Configure GitHub Pages to deploy the `dist/` directory from a GitHub Actions workflow:
-
-1. Install dependencies with `npm ci`.
-2. Build the project with `npm run build`.
-3. Upload `dist/` as the Pages artifact.
-4. Deploy the artifact with GitHub's Pages deployment action.
-
-Although the application is built as a single HTML file, it still requests live TLE data and the Blue Marble Earth texture at runtime. If those requests fail, the app uses its built-in orbital and procedural-Earth fallbacks.
-
 ## Data and Orbit Model
 
 Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
@@ -114,4 +105,3 @@ npx tsc --noEmit
 npm run build
 npm audit
 ```
-
