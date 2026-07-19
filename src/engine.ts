@@ -264,8 +264,9 @@ export function createEngine(
     if (!paused) simTime += dt * 1000 * speed;
     const date = new Date(simTime);
 
-    // Earth rotation (GMST) — align ECEF texture with ECI frame
-    earth.rotation.y = gmst(date) + Math.PI / 2;
+    // Earth rotation (GMST) — the equirectangular texture's prime meridian is
+    // centered on local +X, so no additional longitude offset is needed.
+    earth.rotation.y = gmst(date);
 
     // Sun direction
     const s = sunDirectionECI(date);
