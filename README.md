@@ -1,5 +1,7 @@
 # Earth Orbit Live
 
+![Earth Orbit Live showing multicolored satellite paths around the planet](public/assets/earth-orbit-social.png)
+
 An interactive 3D visualization of Earth-orbiting satellites, built with React, Three.js, and `satellite.js`. The app loads current TLE data from CelesTrak, propagates live objects with SGP4, and falls back to clearly labeled simulated constellations when a data source is unavailable.
 
 The visualization runs entirely in the browser and requires no backend.
