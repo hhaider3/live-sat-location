@@ -1,6 +1,14 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { LoadedGroup, Sat, eciPosition, gmst } from "./satellites";
+import {
+  LoadedGroup,
+  R_EARTH,
+  Sat,
+  eciPosition,
+  eciState,
+  gmst,
+  sampleOrbitPath,
+} from "./satellites";
 
 const KM_TO_UNITS = 1 / 1000; // 1 scene unit = 1000 km
 const EARTH_RADIUS = 6371 * KM_TO_UNITS;
@@ -8,9 +16,20 @@ const HIDDEN = 1e6; // park failed sats far away
 
 interface GroupRender {
   key: string;
+  label: string;
+  colorCss: string;
   sats: Sat[];
   points: THREE.Points;
   positions: Float32Array;
+}
+
+export interface SatSelection {
+  key: string;
+  label: string;
+  color: string;
+  name: string;
+  altitudeKm: number;
+  velocityKmS: number;
 }
 
 export interface Engine {
@@ -20,6 +39,7 @@ export interface Engine {
   setPaused(paused: boolean): void;
   setTime(ms: number): void;
   getTime(): number;
+  clearSelection(): void;
   dispose(): void;
 }
 
@@ -91,7 +111,8 @@ const eciToScene = (p: { x: number; y: number; z: number }, out: THREE.Vector3) 
 
 export function createEngine(
   container: HTMLElement,
-  onTick?: (simTimeMs: number, fps: number) => void
+  onTick?: (simTimeMs: number, fps: number) => void,
+  onSelect?: (selection: SatSelection | null) => void
 ): Engine {
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -192,7 +213,20 @@ export function createEngine(
   }
   const sprite = circleSprite();
 
+  function ringSprite(): THREE.Texture {
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const ctx = c.getContext("2d")!;
+    ctx.strokeStyle = "rgba(255,255,255,0.95)";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.arc(32, 32, 24, 0, Math.PI * 2);
+    ctx.stroke();
+    return new THREE.CanvasTexture(c);
+  }
+
   function clearGroupRenders() {
+    if (selected) selectTarget(null);
     for (const gr of groupRenders) {
       scene.remove(gr.points);
       gr.points.geometry.dispose();
@@ -233,7 +267,14 @@ export function createEngine(
       const points = new THREE.Points(geo, mat);
       points.frustumCulled = false;
       scene.add(points);
-      const gr: GroupRender = { key: g.key, sats: g.sats, points, positions };
+      const gr: GroupRender = {
+        key: g.key,
+        label: g.label,
+        colorCss: g.color,
+        sats: g.sats,
+        points,
+        positions,
+      };
       groupRenders.push(gr);
       for (let i = 0; i < g.sats.length; i++) flat.push({ g: gr, i });
     }
@@ -244,6 +285,220 @@ export function createEngine(
   let simTime = Date.now();
   let speed = 1;
   let paused = false;
+
+  // ---------- Selection & hover ----------
+  const ORBIT_SAMPLES = 256;
+  const ORBIT_REFRESH_MS = 5 * 60 * 1000; // re-sample the path as it precesses
+
+  const ringTex = ringSprite();
+  const ringMat = new THREE.SpriteMaterial({
+    map: ringTex,
+    color: 0xffffff,
+    transparent: true,
+    depthTest: false, // the marker stays findable even behind Earth
+  });
+  const selectionRing = new THREE.Sprite(ringMat);
+  selectionRing.visible = false;
+  scene.add(selectionRing);
+
+  const orbitGeometry = new THREE.BufferGeometry();
+  const orbitPositions = new Float32Array(ORBIT_SAMPLES * 3);
+  orbitGeometry.setAttribute("position", new THREE.BufferAttribute(orbitPositions, 3));
+  const orbitMat = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.55,
+  });
+  const orbitLine = new THREE.LineLoop(orbitGeometry, orbitMat);
+  orbitLine.frustumCulled = false;
+  orbitLine.visible = false;
+  scene.add(orbitLine);
+
+  let selected: { g: GroupRender; i: number } | null = null;
+  let orbitEpochMs = 0;
+
+  // Engine-owned tooltip so hover never triggers React renders.
+  const tooltip = document.createElement("div");
+  tooltip.style.cssText = [
+    "position:absolute",
+    "left:0",
+    "top:0",
+    "z-index:30",
+    "pointer-events:none",
+    "padding:4px 9px",
+    "border-radius:8px",
+    "background:rgba(2,6,23,0.85)",
+    "border:1px solid rgba(255,255,255,0.18)",
+    "color:#e2e8f0",
+    "font:600 11px/1.4 ui-sans-serif,system-ui,sans-serif",
+    "white-space:nowrap",
+    "display:none",
+  ].join(";");
+  container.appendChild(tooltip);
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const earthSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), EARTH_RADIUS);
+  const pickDir = new THREE.Vector3();
+  const pickRay = new THREE.Ray();
+  const sphereHit = new THREE.Vector3();
+
+  let pointerX = 0;
+  let pointerY = 0;
+  let pointerMoved = false;
+  let pointerIsMouse = false;
+  let downX = 0;
+  let downY = 0;
+
+  function isOccludedByEarth(p: THREE.Vector3): boolean {
+    pickDir.subVectors(p, camera.position);
+    const dist = pickDir.length();
+    pickRay.origin.copy(camera.position);
+    pickRay.direction.copy(pickDir.normalize());
+    const hit = pickRay.intersectSphere(earthSphere, sphereHit);
+    return hit !== null && camera.position.distanceTo(hit) < dist - 1e-4;
+  }
+
+  function pickAt(x: number, y: number): { g: GroupRender; i: number } | null {
+    const visible = groupRenders.filter((g) => g.points.visible);
+    if (visible.length === 0) return null;
+    const rect = renderer.domElement.getBoundingClientRect();
+    ndc.set(
+      ((x - rect.left) / rect.width) * 2 - 1,
+      -((y - rect.top) / rect.height) * 2 + 1
+    );
+    raycaster.setFromCamera(ndc, camera);
+    raycaster.params.Points.threshold = Math.max(0.1, camera.position.length() * 0.012);
+    const hits = raycaster.intersectObjects(
+      visible.map((g) => g.points),
+      false
+    );
+    for (const hit of hits) {
+      if (hit.index === undefined || !hit.point) continue;
+      if (isOccludedByEarth(hit.point)) continue;
+      const g = visible.find((gr) => gr.points === hit.object);
+      if (g) return { g, i: hit.index };
+    }
+    return null;
+  }
+
+  function rebuildOrbit() {
+    if (!selected) return;
+    const sat = selected.g.sats[selected.i];
+    const ok = sampleOrbitPath(sat, new Date(simTime), ORBIT_SAMPLES, orbitPositions);
+    if (ok) {
+      for (let k = 0; k < ORBIT_SAMPLES; k++) {
+        const x = orbitPositions[k * 3];
+        const y = orbitPositions[k * 3 + 1];
+        const z = orbitPositions[k * 3 + 2];
+        // ECI (x, y, z) -> scene (x, z, -y)
+        orbitPositions[k * 3] = x * KM_TO_UNITS;
+        orbitPositions[k * 3 + 1] = z * KM_TO_UNITS;
+        orbitPositions[k * 3 + 2] = -y * KM_TO_UNITS;
+      }
+      (orbitGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      orbitEpochMs = simTime;
+    }
+    orbitLine.visible = ok;
+  }
+
+  function emitSelection() {
+    if (!onSelect) return;
+    if (!selected) {
+      onSelect(null);
+      return;
+    }
+    const sat = selected.g.sats[selected.i];
+    const st = eciState(sat, new Date(simTime));
+    onSelect({
+      key: selected.g.key,
+      label: selected.g.label,
+      color: selected.g.colorCss,
+      name: sat.name,
+      altitudeKm: st ? Math.hypot(st.x, st.y, st.z) - R_EARTH : NaN,
+      velocityKmS: st ? Math.hypot(st.vx, st.vy, st.vz) : NaN,
+    });
+  }
+
+  function selectTarget(target: { g: GroupRender; i: number } | null) {
+    if (disposed) {
+      selected = null;
+      return;
+    }
+    selected = target;
+    if (selected) {
+      orbitMat.color.set(selected.g.colorCss);
+      rebuildOrbit();
+    } else {
+      orbitLine.visible = false;
+      selectionRing.visible = false;
+    }
+    emitSelection();
+  }
+
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.button !== 0) return;
+    downX = e.clientX;
+    downY = e.clientY;
+  };
+  const onPointerMove = (e: PointerEvent) => {
+    pointerX = e.clientX;
+    pointerY = e.clientY;
+    pointerIsMouse = e.pointerType === "mouse";
+    pointerMoved = true;
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.button !== 0) return;
+    // Only treat it as a click when the drag never really started; otherwise
+    // it was a camera rotate/zoom.
+    if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+    selectTarget(pickAt(e.clientX, e.clientY));
+  };
+  const onPointerLeave = () => {
+    pointerMoved = false;
+    tooltip.style.display = "none";
+    renderer.domElement.style.cursor = "";
+  };
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape") selectTarget(null);
+  };
+  renderer.domElement.addEventListener("pointerdown", onPointerDown);
+  renderer.domElement.addEventListener("pointermove", onPointerMove);
+  renderer.domElement.addEventListener("pointerup", onPointerUp);
+  renderer.domElement.addEventListener("pointerleave", onPointerLeave);
+  window.addEventListener("keydown", onKeyDown);
+
+  function updateHover() {
+    if (!pointerMoved || !pointerIsMouse) return;
+    pointerMoved = false;
+    const target = pickAt(pointerX, pointerY);
+    if (target) {
+      tooltip.textContent = `${target.g.sats[target.i].name} · ${target.g.label}`;
+      const rect = renderer.domElement.getBoundingClientRect();
+      tooltip.style.transform = `translate(${pointerX - rect.left + 14}px, ${
+        pointerY - rect.top - 34
+      }px)`;
+      tooltip.style.display = "block";
+      renderer.domElement.style.cursor = "pointer";
+    } else {
+      tooltip.style.display = "none";
+      renderer.domElement.style.cursor = "";
+    }
+  }
+
+  function updateSelectionVisuals() {
+    if (!selected) return;
+    const i3 = selected.i * 3;
+    const x = selected.g.positions[i3];
+    if (x >= HIDDEN * 0.5) {
+      selectionRing.visible = false; // propagation parked this satellite
+    } else {
+      selectionRing.visible = true;
+      selectionRing.position.set(x, selected.g.positions[i3 + 1], selected.g.positions[i3 + 2]);
+      selectionRing.scale.setScalar(camera.position.length() * 0.035);
+    }
+    if (Math.abs(simTime - orbitEpochMs) > ORBIT_REFRESH_MS) rebuildOrbit();
+  }
 
   // ---------- Loop ----------
   const timer = new THREE.Timer();
@@ -295,6 +550,9 @@ export function createEngine(
         (g.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
     }
 
+    updateHover();
+    updateSelectionVisuals();
+
     controls.update();
     renderer.render(scene, camera);
 
@@ -309,6 +567,7 @@ export function createEngine(
     if (onTick && now - lastUi > 200) {
       lastUi = now;
       onTick(simTime, fps);
+      if (selected) emitSelection();
     }
   }
   animate();
@@ -327,6 +586,7 @@ export function createEngine(
     setGroupVisible(key, visible) {
       const g = groupRenders.find((r) => r.key === key);
       if (g) g.points.visible = visible;
+      if (!visible && selected?.g.key === key) selectTarget(null);
     },
     setSpeed(m) {
       speed = m;
@@ -340,11 +600,19 @@ export function createEngine(
     getTime() {
       return simTime;
     },
+    clearSelection() {
+      selectTarget(null);
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
+      window.removeEventListener("keydown", onKeyDown);
+      renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      renderer.domElement.removeEventListener("pointermove", onPointerMove);
+      renderer.domElement.removeEventListener("pointerup", onPointerUp);
+      renderer.domElement.removeEventListener("pointerleave", onPointerLeave);
       timer.dispose();
       controls.dispose();
       clearGroupRenders();
@@ -356,6 +624,11 @@ export function createEngine(
       stars.geometry.dispose();
       (stars.material as THREE.Material).dispose();
       sprite.dispose();
+      ringTex.dispose();
+      ringMat.dispose();
+      orbitGeometry.dispose();
+      orbitMat.dispose();
+      tooltip.remove();
       renderer.dispose();
       renderer.domElement.remove();
     },

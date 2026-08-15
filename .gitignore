@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.wrangler/
+
+resume.tex
 
 .DS_Store
 *.local

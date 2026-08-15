@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createEngine, Engine } from "./engine";
+import { createEngine, Engine, SatSelection } from "./engine";
 import { GROUP_DEFS, LoadedGroup, loadGroup } from "./satellites";
 
 // ---------- Helpers ----------
@@ -7,6 +7,12 @@ import { GROUP_DEFS, LoadedGroup, loadGroup } from "./satellites";
 function fmtUTC(ms: number): string {
   const d = new Date(ms);
   return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
+
+function fmtValue(v: number, digits: number, unit: string): string {
+  return isNaN(v)
+    ? "—"
+    : `${v.toLocaleString(undefined, { maximumFractionDigits: digits })} ${unit}`;
 }
 
 function toLocalInputValue(ms: number): string {
@@ -60,6 +66,7 @@ export default function App() {
   const [dateInput, setDateInput] = useState(toLocalInputValue(Date.now()));
   const [editingDate, setEditingDate] = useState(false);
   const [groups, setGroups] = useState<GroupView[]>([]);
+  const [selection, setSelection] = useState<SatSelection | null>(null);
   const [loadingCount, setLoadingCount] = useState(GROUP_DEFS.length);
   const [panelOpen, setPanelOpen] = useState(() =>
     window.matchMedia("(min-width: 640px)").matches
@@ -71,10 +78,14 @@ export default function App() {
   useEffect(() => {
     if (!containerRef.current) return;
     visibilityRef.current.clear();
-    const engine = createEngine(containerRef.current, (t, f) => {
-      setSimTime(t);
-      setFps(f);
-    });
+    const engine = createEngine(
+      containerRef.current,
+      (t, f) => {
+        setSimTime(t);
+        setFps(f);
+      },
+      setSelection
+    );
     engineRef.current = engine;
     engine.setSpeed(1);
 
@@ -208,6 +219,47 @@ export default function App() {
               <span className="ml-auto font-mono text-slate-500">{fps.toFixed(0)} fps</span>
             </div>
           </div>
+
+          {selection && (
+            <div className="mt-2 rounded-2xl border border-white/10 bg-black/50 px-5 py-3.5 shadow-2xl backdrop-blur-md">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full"
+                    style={{
+                      backgroundColor: selection.color,
+                      boxShadow: `0 0 6px ${selection.color}`,
+                    }}
+                  />
+                  <span className="truncate text-sm font-bold text-white" title={selection.name}>
+                    {selection.name}
+                  </span>
+                </div>
+                <button
+                  onClick={() => engineRef.current?.clearSelection()}
+                  title="Deselect (Esc)"
+                  className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-white/10 bg-white/5 text-[11px] text-slate-400 transition hover:bg-white/15 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+              <p className="mt-0.5 pl-[18px] text-[11px] text-slate-400">{selection.label}</p>
+              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 pl-[18px] text-xs text-slate-400">
+                <span>
+                  alt{" "}
+                  <b className="font-mono font-semibold text-sky-300">
+                    {fmtValue(selection.altitudeKm, 0, "km")}
+                  </b>
+                </span>
+                <span>
+                  vel{" "}
+                  <b className="font-mono font-semibold text-sky-300">
+                    {fmtValue(selection.velocityKmS, 2, "km/s")}
+                  </b>
+                </span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Constellation legend */}
@@ -336,7 +388,7 @@ export default function App() {
 
       {/* Hint */}
       <div className="pointer-events-none absolute bottom-28 left-1/2 z-0 -translate-x-1/2 text-[10px] text-slate-600">
-        drag to rotate · scroll to zoom
+        drag to rotate · scroll to zoom · click a satellite for details
       </div>
     </div>
   );

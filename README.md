@@ -15,6 +15,7 @@ The visualization runs entirely in the browser and requires no backend.
 - Offline simulated-orbit fallbacks for unavailable groups
 - Clear `Live`, `Mixed`, `Offline`, and loading states
 - Starlink, OneWeb, GPS, GLONASS, Galileo, BeiDou, Iridium, space station, geostationary, and science/weather groups
+- Hover any satellite for its name, click it for altitude, velocity, and a full orbit path
 - Per-constellation visibility controls
 - Pause, reverse, date selection, and return-to-now controls
 - Logarithmic speed control from real time to accelerated simulation
@@ -27,6 +28,9 @@ The visualization runs entirely in the browser and requires no backend.
 | --- | --- |
 | Drag | Rotate the camera around Earth |
 | Scroll or pinch | Zoom in and out |
+| Hover | Show a satellite's name |
+| Click | Select a satellite: name, altitude, velocity, and orbit path |
+| `Esc` or ✕ | Deselect the satellite |
 | Pause/play | Stop or resume simulation time |
 | Forward/reverse | Change the direction of time |
 | Speed slider | Adjust the simulation speed |
@@ -47,12 +51,21 @@ The simulation starts at **1× real-time speed**. On phone-sized screens, the co
 
 ### Install and run
 
+The app and its TLE API run as two processes. The Vite dev server proxies `/api` to a local Cloudflare Worker, which serves and caches CelesTrak data:
+
 ```bash
 npm ci
+
+# terminal 1 — Worker API on http://127.0.0.1:8787
+npm run dev:worker
+
+# terminal 2 — app on http://localhost:5173
 npm run dev
 ```
 
 Open the local URL printed by Vite, usually `http://localhost:5173`.
+
+Running `npm run dev` without the Worker still works, but every group falls back to simulated orbits because `/api/tle` has nothing to answer.
 
 ### Production build
 
@@ -70,7 +83,7 @@ npm run preview
 
 ## Data and Orbit Model
 
-Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format through a same-origin Cloudflare Worker endpoint. Successful responses are cached at the edge for two hours to respect CelesTrak's update schedule and prevent every visitor from downloading the same data directly. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
+Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format through a same-origin Cloudflare Worker endpoint. Successful responses are cached at the edge for two hours to respect CelesTrak's update schedule and prevent every visitor from downloading the same data directly. If CelesTrak is unreachable, the Worker serves the last good copy it has (up to 30 days old) instead of an error, so an outage degrades data freshness rather than dropping the app to simulation. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
 
 When a group cannot be fetched or parsed within the request timeout, the app creates a synthetic circular-orbit approximation for that group. Simulated groups are marked with `sim` in the constellation panel and are included in the `Mixed` or `Offline` status rather than being presented as live data.
 

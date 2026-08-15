@@ -16,4 +16,12 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  server: {
+    proxy: {
+      // The TLE endpoint lives in the Cloudflare Worker (see worker/index.js).
+      // `npm run dev:worker` serves it on 127.0.0.1:8787; without it, every
+      // group silently falls back to simulated orbits.
+      "/api": "http://127.0.0.1:8787",
+    },
+  },
 });

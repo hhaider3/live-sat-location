@@ -29,7 +29,7 @@ export interface LoadedGroup extends GroupDef {
 
 const KEPLER_EPOCH_MS = Date.UTC(2024, 0, 1);
 const MU = 398600.4418; // km^3/s^2
-const R_EARTH = 6371;
+export const R_EARTH = 6371; // km
 
 // ---------- Position propagation ----------
 
@@ -60,6 +60,102 @@ export function eciPosition(sat: Sat, date: Date): { x: number; y: number; z: nu
   scratch.y = sat.radiusKm * (sO * cu + cO * su * ci);
   scratch.z = sat.radiusKm * (su * si);
   return scratch;
+}
+
+export interface EciState {
+  x: number;
+  y: number;
+  z: number; // km
+  vx: number;
+  vy: number;
+  vz: number; // km/s
+}
+
+/**
+ * Full ECI state for a single satellite. Unlike eciPosition this returns a
+ * fresh object and includes velocity — use it for the selection panel, not the
+ * per-frame batch loop.
+ */
+export function eciState(sat: Sat, date: Date): EciState | null {
+  if (sat.kind === "sgp4") {
+    try {
+      const pv = satlib.propagate(sat.satrec, date);
+      const p = pv?.position;
+      const v = pv?.velocity;
+      if (
+        !p || typeof p === "boolean" || !isFinite(p.x) ||
+        !v || typeof v === "boolean" || !isFinite(v.x)
+      ) {
+        return null;
+      }
+      return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
+    } catch {
+      return null;
+    }
+  }
+  // Circular Keplerian orbit: v = (dp/du) * n
+  const t = (date.getTime() - KEPLER_EPOCH_MS) / 1000;
+  const u = sat.m0 + sat.n * t;
+  const cu = Math.cos(u);
+  const su = Math.sin(u);
+  const cO = Math.cos(sat.raan);
+  const sO = Math.sin(sat.raan);
+  const ci = Math.cos(sat.inc);
+  const si = Math.sin(sat.inc);
+  const R = sat.radiusKm;
+  const rn = R * sat.n;
+  return {
+    x: R * (cO * cu - sO * su * ci),
+    y: R * (sO * cu + cO * su * ci),
+    z: R * (su * si),
+    vx: rn * (-cO * su - sO * cu * ci),
+    vy: rn * (-sO * su + cO * cu * ci),
+    vz: rn * (cu * si),
+  };
+}
+
+/** Orbital period in minutes, for sampling an orbit path. */
+export function orbitPeriodMin(sat: Sat): number {
+  if (sat.kind === "sgp4") return (2 * Math.PI) / sat.satrec.no; // satrec.no is rad/min
+  return (2 * Math.PI) / sat.n / 60;
+}
+
+/**
+ * Samples one full ECI orbit (positions in km) starting at `date` into `out`,
+ * laid out as samples * 3 floats. Returns false if propagation fails partway.
+ */
+export function sampleOrbitPath(
+  sat: Sat,
+  date: Date,
+  samples: number,
+  out: Float32Array
+): boolean {
+  if (sat.kind === "kepler") {
+    const cO = Math.cos(sat.raan);
+    const sO = Math.sin(sat.raan);
+    const ci = Math.cos(sat.inc);
+    const si = Math.sin(sat.inc);
+    const R = sat.radiusKm;
+    for (let k = 0; k < samples; k++) {
+      const u = (k / samples) * 2 * Math.PI;
+      const cu = Math.cos(u);
+      const su = Math.sin(u);
+      out[k * 3] = R * (cO * cu - sO * su * ci);
+      out[k * 3 + 1] = R * (sO * cu + cO * su * ci);
+      out[k * 3 + 2] = R * (su * si);
+    }
+    return true;
+  }
+  const periodMin = orbitPeriodMin(sat);
+  const t0 = date.getTime();
+  for (let k = 0; k < samples; k++) {
+    const p = eciPosition(sat, new Date(t0 + (k / samples) * periodMin * 60000));
+    if (!p) return false;
+    out[k * 3] = p.x;
+    out[k * 3 + 1] = p.y;
+    out[k * 3 + 2] = p.z;
+  }
+  return true;
 }
 
 // ---------- Synthetic constellation generators (offline fallback) ----------
