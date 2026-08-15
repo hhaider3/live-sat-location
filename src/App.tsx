@@ -71,6 +71,7 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(() =>
     window.matchMedia("(min-width: 640px)").matches
   );
+  const [playerOpen, setPlayerOpen] = useState(false); // mobile: expand time controls
 
   const speed = useMemo(() => (reverse ? -1 : 1) * Math.pow(10, exp), [exp, reverse]);
 
@@ -145,6 +146,20 @@ export default function App() {
         : liveGroupCount === 0
           ? "offline"
           : "mixed";
+
+  const presetButtons = PRESETS.map((p) => (
+    <button
+      key={p.label}
+      onClick={() => setExp(p.exp)}
+      className={`rounded-md px-2 py-1 text-[10px] font-semibold transition ${
+        Math.abs(exp - p.exp) < 0.01
+          ? "bg-sky-500 text-white"
+          : "bg-white/5 text-slate-400 hover:bg-white/15 hover:text-white"
+      }`}
+    >
+      {p.label}
+    </button>
+  ));
 
   const applyDate = (value: string) => {
     const ms = new Date(value).getTime();
@@ -273,7 +288,7 @@ export default function App() {
               <span className="text-slate-500">{panelOpen ? "▾" : "▸"}</span>
             </button>
             {panelOpen && (
-              <div className="max-h-[calc(100vh-30rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
+              <div className="max-h-[calc(100vh-24rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
                 {groups.map((g) => (
                   <button
                     key={g.key}
@@ -305,53 +320,61 @@ export default function App() {
       </div>
 
       {/* Bottom control bar */}
-      <div className="absolute inset-x-0 bottom-4 z-10 flex justify-center px-4">
-        <div className="flex w-full max-w-3xl flex-col gap-3 rounded-2xl border border-white/10 bg-black/55 px-5 py-4 shadow-2xl backdrop-blur-md">
-          {/* Clock + date controls */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="font-mono text-sm font-semibold tracking-tight text-sky-300">
-              {fmtUTC(simTime)}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-2 pb-[env(safe-area-inset-bottom)] sm:bottom-4 sm:px-4 sm:pb-0">
+        <div className="pointer-events-auto w-full max-w-3xl rounded-2xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-md">
+          {/* Time details — always visible on desktop, toggled on mobile */}
+          <div
+            className={`${
+              playerOpen ? "flex" : "hidden"
+            } flex-col gap-2.5 border-b border-white/10 px-4 pb-3 pt-3 sm:flex sm:border-b-0 sm:px-5 sm:pb-0 sm:pt-3.5`}
+          >
+            <div className="flex items-center gap-2 text-xs">
+              <div className="truncate font-mono font-semibold tracking-tight text-sky-300">
+                {fmtUTC(simTime)}
+              </div>
+              <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                <input
+                  type="datetime-local"
+                  value={dateInput}
+                  onFocus={() => setEditingDate(true)}
+                  onBlur={() => setEditingDate(false)}
+                  onChange={(e) => {
+                    setDateInput(e.target.value);
+                    applyDate(e.target.value);
+                  }}
+                  className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-slate-200 outline-none [color-scheme:dark] focus:border-sky-500/60"
+                />
+                <button
+                  onClick={() => engineRef.current?.setTime(Date.now())}
+                  className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition hover:bg-white/15"
+                >
+                  Now
+                </button>
+              </div>
             </div>
-            <div className="ml-auto flex items-center gap-2">
-              <input
-                type="datetime-local"
-                value={dateInput}
-                onFocus={() => setEditingDate(true)}
-                onBlur={() => setEditingDate(false)}
-                onChange={(e) => {
-                  setDateInput(e.target.value);
-                  applyDate(e.target.value);
-                }}
-                className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-200 outline-none [color-scheme:dark] focus:border-sky-500/60"
-              />
-              <button
-                onClick={() => engineRef.current?.setTime(Date.now())}
-                className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/15"
-              >
-                Now
-              </button>
-            </div>
+            {/* Speed presets — mobile only (desktop shows them inline below) */}
+            <div className="flex gap-1 sm:hidden">{presetButtons}</div>
           </div>
 
-          {/* Playback + speed */}
-          <div className="flex flex-wrap items-center gap-3">
+          {/* Main row — the only row visible on a collapsed phone */}
+          <div className="flex items-center gap-2 px-3 py-2 sm:gap-3 sm:px-5 sm:py-3">
             <button
               onClick={() => setPaused((p) => !p)}
-              className="grid h-9 w-9 place-items-center rounded-full bg-sky-500 text-sm text-white shadow-lg shadow-sky-500/30 transition hover:bg-sky-400"
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-sky-500 text-sm text-white shadow-lg shadow-sky-500/30 transition hover:bg-sky-400"
               title={paused ? "Play" : "Pause"}
             >
               {paused ? "▶" : "⏸"}
             </button>
             <button
               onClick={() => setReverse((r) => !r)}
-              className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
+              className={`shrink-0 rounded-lg border px-2 py-1.5 text-xs font-semibold transition ${
                 reverse
                   ? "border-rose-400/50 bg-rose-500/20 text-rose-300"
                   : "border-white/10 bg-white/5 text-slate-300 hover:bg-white/15"
               }`}
               title="Reverse time"
             >
-              {reverse ? "◀◀ rev" : "▶▶ fwd"}
+              ◀◀
             </button>
 
             <input
@@ -361,33 +384,28 @@ export default function App() {
               step={0.01}
               value={exp}
               onChange={(e) => setExp(parseFloat(e.target.value))}
-              className="h-1.5 min-w-[120px] flex-1 cursor-pointer appearance-none rounded-full bg-white/15 accent-sky-400"
+              className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-white/15 accent-sky-400"
             />
-            <span className="w-20 text-right font-mono text-xs font-semibold text-sky-300">
+            <span className="w-14 shrink-0 text-right font-mono text-xs font-semibold text-sky-300 sm:w-20">
               {paused ? "paused" : fmtSpeed(speed)}
             </span>
 
-            <div className="flex gap-1">
-              {PRESETS.map((p) => (
-                <button
-                  key={p.label}
-                  onClick={() => setExp(p.exp)}
-                  className={`rounded-md px-2 py-1 text-[10px] font-semibold transition ${
-                    Math.abs(exp - p.exp) < 0.01
-                      ? "bg-sky-500 text-white"
-                      : "bg-white/5 text-slate-400 hover:bg-white/15 hover:text-white"
-                  }`}
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
+            <div className="hidden shrink-0 gap-1 sm:flex">{presetButtons}</div>
+
+            <button
+              onClick={() => setPlayerOpen((o) => !o)}
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/10 bg-white/5 text-[10px] text-slate-400 transition hover:bg-white/15 hover:text-white sm:hidden"
+              title={playerOpen ? "Hide time controls" : "Show clock, date, and presets"}
+              aria-expanded={playerOpen}
+            >
+              {playerOpen ? "▾" : "▴"}
+            </button>
           </div>
         </div>
       </div>
 
       {/* Hint */}
-      <div className="pointer-events-none absolute bottom-28 left-1/2 z-0 -translate-x-1/2 text-[10px] text-slate-600">
+      <div className="pointer-events-none absolute bottom-20 left-1/2 z-0 hidden -translate-x-1/2 text-[10px] text-slate-600 sm:block">
         drag to rotate · scroll to zoom · click a satellite for details
       </div>
     </div>
