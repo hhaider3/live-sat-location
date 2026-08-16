@@ -179,7 +179,7 @@ export default function App() {
   };
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-[#01020a] font-sans text-slate-200 select-none">
+    <div className="relative h-[var(--app-height)] w-screen overflow-hidden bg-[#01020a] font-sans text-slate-200 select-none">
       {/* 3D canvas */}
       <div ref={containerRef} className="absolute inset-0" />
 
@@ -302,7 +302,7 @@ export default function App() {
               <span className="text-slate-500">{panelOpen ? "▾" : "▸"}</span>
             </button>
             {panelOpen && (
-              <div className="max-h-[calc(100vh-20rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
+              <div className="max-h-[calc(var(--app-height)-20rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
                 {groups.map((g) => (
                   <button
                     key={g.key}

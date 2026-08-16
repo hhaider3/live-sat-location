@@ -1,1 +1,17 @@
 @import "tailwindcss";
+
+/* On mobile Chrome/Safari, 100vh ignores the URL bar, making the app taller
+   than the visible screen and pushing bottom-anchored UI below the fold.
+   Use the dynamic viewport height where supported. */
+:root {
+  --app-height: 100vh;
+}
+@supports (height: 100dvh) {
+  :root {
+    --app-height: 100dvh;
+  }
+}
+
+body {
+  overscroll-behavior-y: none;
+}
