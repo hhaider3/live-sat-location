@@ -184,36 +184,41 @@ export default function App() {
       <div ref={containerRef} className="absolute inset-0" />
 
       {/* Top panels */}
-      <div className="pointer-events-none absolute inset-x-3 top-3 z-10 flex flex-col gap-2 sm:inset-x-4 sm:top-4 sm:flex-row sm:items-start sm:justify-between">
+      <div className="pointer-events-none absolute inset-x-2 top-2 z-10 flex flex-col gap-2 sm:inset-x-4 sm:top-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="pointer-events-auto w-full sm:max-w-xs">
-          <div className="rounded-2xl border border-white/10 bg-black/50 px-5 py-4 shadow-2xl backdrop-blur-md">
-            <h1 className="text-lg font-bold tracking-tight text-white">
-              🌍 Earth Orbit{" "}
-              <span
-                className={
-                  dataMode === "live"
-                    ? "text-emerald-400"
+          <div className="rounded-2xl border border-white/10 bg-black/50 px-3 py-2 shadow-2xl backdrop-blur-md sm:px-5 sm:py-4">
+            <div className="flex items-center gap-2">
+              <h1 className="text-sm font-bold tracking-tight text-white sm:text-lg">
+                🌍 Earth Orbit{" "}
+                <span
+                  className={
+                    dataMode === "live"
+                      ? "text-emerald-400"
+                      : dataMode === "offline"
+                        ? "text-slate-400"
+                        : dataMode === "mixed"
+                          ? "text-amber-400"
+                          : "text-sky-400"
+                  }
+                >
+                  {dataMode === "live"
+                    ? "Live"
                     : dataMode === "offline"
-                      ? "text-slate-400"
+                      ? "Offline"
                       : dataMode === "mixed"
-                        ? "text-amber-400"
-                        : "text-sky-400"
-                }
-              >
-                {dataMode === "live"
-                  ? "Live"
-                  : dataMode === "offline"
-                    ? "Offline"
-                    : dataMode === "mixed"
-                      ? "Mixed"
-                      : "Loading"}
+                        ? "Mixed"
+                        : "Loading"}
+                </span>
+              </h1>
+              <span className="ml-auto rounded-md bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-sky-300 sm:hidden">
+                {totalSats.toLocaleString()}
               </span>
-            </h1>
-            <p className="mt-0.5 text-[11px] leading-snug text-slate-400">
+            </div>
+            <p className="mt-0.5 hidden text-[11px] leading-snug text-slate-400 sm:block">
               Satellite tracker with SGP4 propagation for live TLEs and clearly marked simulated
               fallbacks when a source is unavailable.
             </p>
-            <div className="mt-3 flex items-center gap-3 text-xs">
+            <div className="mt-3 hidden items-center gap-3 text-xs sm:flex">
               <span className="rounded-md bg-sky-500/15 px-2 py-1 font-mono font-semibold text-sky-300">
                 {totalSats.toLocaleString()} sats
               </span>
@@ -236,8 +241,8 @@ export default function App() {
           </div>
 
           {selection && (
-            <div className="mt-2 rounded-2xl border border-white/10 bg-black/50 px-5 py-3.5 shadow-2xl backdrop-blur-md">
-              <div className="flex items-center justify-between gap-3">
+            <div className="mt-2 rounded-2xl border border-white/10 bg-black/50 px-3 py-2 shadow-2xl backdrop-blur-md sm:px-5 sm:py-3.5">
+              <div className="flex items-center gap-2 sm:justify-between sm:gap-3">
                 <div className="flex min-w-0 items-center gap-2">
                   <span
                     className="h-2.5 w-2.5 shrink-0 rounded-full"
@@ -246,10 +251,17 @@ export default function App() {
                       boxShadow: `0 0 6px ${selection.color}`,
                     }}
                   />
-                  <span className="truncate text-sm font-bold text-white" title={selection.name}>
+                  <span
+                    className="truncate text-xs font-bold text-white sm:text-sm"
+                    title={selection.name}
+                  >
                     {selection.name}
                   </span>
                 </div>
+                <span className="ml-auto shrink-0 font-mono text-[10px] text-sky-300 sm:hidden">
+                  {fmtValue(selection.altitudeKm, 0, "km")} ·{" "}
+                  {fmtValue(selection.velocityKmS, 2, "km/s")}
+                </span>
                 <button
                   onClick={() => engineRef.current?.clearSelection()}
                   title="Deselect (Esc)"
@@ -258,8 +270,10 @@ export default function App() {
                   ✕
                 </button>
               </div>
-              <p className="mt-0.5 pl-[18px] text-[11px] text-slate-400">{selection.label}</p>
-              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 pl-[18px] text-xs text-slate-400">
+              <p className="mt-0.5 hidden pl-[18px] text-[11px] text-slate-400 sm:block">
+                {selection.label}
+              </p>
+              <div className="mt-2 hidden flex-wrap gap-x-5 gap-y-1 pl-[18px] text-xs text-slate-400 sm:flex">
                 <span>
                   alt{" "}
                   <b className="font-mono font-semibold text-sky-300">
@@ -282,18 +296,18 @@ export default function App() {
           <div className="rounded-2xl border border-white/10 bg-black/50 shadow-2xl backdrop-blur-md">
             <button
               onClick={() => setPanelOpen((o) => !o)}
-              className="flex w-full items-center justify-between gap-8 px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-slate-300 hover:text-white"
+              className="flex w-full items-center justify-between gap-8 px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-slate-300 hover:text-white sm:px-4 sm:py-2.5 sm:text-xs"
             >
               Constellations
               <span className="text-slate-500">{panelOpen ? "▾" : "▸"}</span>
             </button>
             {panelOpen && (
-              <div className="max-h-[calc(100vh-24rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
+              <div className="max-h-[calc(100vh-20rem)] overflow-y-auto px-2 pb-2 sm:max-h-[55vh]">
                 {groups.map((g) => (
                   <button
                     key={g.key}
                     onClick={() => toggleGroup(g.key)}
-                    className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs transition hover:bg-white/5 ${
+                    className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1 text-left text-xs transition hover:bg-white/5 sm:py-1.5 ${
                       g.visible ? "" : "opacity-35"
                     }`}
                   >
