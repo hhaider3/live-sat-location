@@ -89,6 +89,6 @@ test('unknown groups, legacy API, and non-GET methods do not reach upstream', as
   const ctx = { waitUntil() {} };
   assert.equal((await worker.fetch(new Request('https://orbit.test/api/omm?group=bad'), env, ctx)).status, 400);
   assert.equal((await worker.fetch(new Request(url, { method: 'POST' }), env, ctx)).status, 405);
-  assert.equal((await worker.fetch(new Request('https://orbit.test/api/tle'), env, ctx)).status, 404);
+  assert.equal((await worker.fetch(new Request('https://orbit.test/api/tle'), env, ctx)).status, 400);
   assert.equal(await (await worker.fetch(new Request('https://orbit.test/'), env, ctx)).text(), 'app');
 });

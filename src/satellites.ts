@@ -1,5 +1,5 @@
 import * as satlib from "satellite.js";
-import { epochMillis, validOmm } from "../shared/omm";
+import { epochMillis, normalizeOmm } from "../shared/omm";
 
 // ---------- Types ----------
 
@@ -21,6 +21,7 @@ export interface GroupDef {
   label: string;
   color: string; // hex
   url: string;
+  legacyUrl: string;
   fallback: () => Sat[];
 }
 
@@ -221,18 +222,20 @@ const fallbackOther = (): Sat[] => [
 
 const CT = (group: string) =>
   `/api/omm?group=${encodeURIComponent(group)}`;
+const LEGACY_CT = (group: string) =>
+  `/api/tle?group=${encodeURIComponent(group)}`;
 
 export const GROUP_DEFS: GroupDef[] = [
-  { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), fallback: fallbackStarlink },
-  { key: "oneweb", label: "OneWeb", color: "#a78bfa", url: CT("oneweb"), fallback: fallbackOneWeb },
-  { key: "gps", label: "GPS", color: "#facc15", url: CT("gps-ops"), fallback: fallbackGps },
-  { key: "glonass", label: "GLONASS", color: "#fb923c", url: CT("glo-ops"), fallback: fallbackGlonass },
-  { key: "galileo", label: "Galileo", color: "#34d399", url: CT("galileo"), fallback: fallbackGalileo },
-  { key: "beidou", label: "BeiDou", color: "#f472b6", url: CT("beidou"), fallback: fallbackBeidou },
-  { key: "iridium", label: "Iridium NEXT", color: "#e879f9", url: CT("iridium-NEXT"), fallback: fallbackIridium },
-  { key: "stations", label: "Space Stations", color: "#ef4444", url: CT("stations"), fallback: fallbackStations },
-  { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), fallback: fallbackGeo },
-  { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), fallback: fallbackOther },
+  { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), legacyUrl: LEGACY_CT("starlink"), fallback: fallbackStarlink },
+  { key: "oneweb", label: "OneWeb", color: "#a78bfa", url: CT("oneweb"), legacyUrl: LEGACY_CT("oneweb"), fallback: fallbackOneWeb },
+  { key: "gps", label: "GPS", color: "#facc15", url: CT("gps-ops"), legacyUrl: LEGACY_CT("gps-ops"), fallback: fallbackGps },
+  { key: "glonass", label: "GLONASS", color: "#fb923c", url: CT("glo-ops"), legacyUrl: LEGACY_CT("glo-ops"), fallback: fallbackGlonass },
+  { key: "galileo", label: "Galileo", color: "#34d399", url: CT("galileo"), legacyUrl: LEGACY_CT("galileo"), fallback: fallbackGalileo },
+  { key: "beidou", label: "BeiDou", color: "#f472b6", url: CT("beidou"), legacyUrl: LEGACY_CT("beidou"), fallback: fallbackBeidou },
+  { key: "iridium", label: "Iridium NEXT", color: "#e879f9", url: CT("iridium-NEXT"), legacyUrl: LEGACY_CT("iridium-NEXT"), fallback: fallbackIridium },
+  { key: "stations", label: "Space Stations", color: "#ef4444", url: CT("stations"), legacyUrl: LEGACY_CT("stations"), fallback: fallbackStations },
+  { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), legacyUrl: LEGACY_CT("geo"), fallback: fallbackGeo },
+  { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), legacyUrl: LEGACY_CT("science"), fallback: fallbackOther },
 ];
 
 // ---------- Validated OMM data and freshness ----------
@@ -254,15 +257,16 @@ export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } 
   const sats: Sat[] = [];
   const seen = new Set<string>();
   for (const record of data) {
-    if (!validOmm(record)) continue;
-    const id = String(record.NORAD_CAT_ID);
+    const normalized = normalizeOmm(record);
+    if (!normalized) continue;
+    const id = String(normalized.NORAD_CAT_ID);
     if (seen.has(id)) continue;
     try {
-      const epochMs = epochMillis(record.EPOCH);
-      const satrec = satlib.json2satrec({ ...record, EPOCH: new Date(epochMs).toISOString() });
+      const epochMs = epochMillis(normalized.EPOCH);
+      const satrec = satlib.json2satrec({ ...normalized, EPOCH: new Date(epochMs).toISOString() });
       const sat: Sat = { kind: "sgp4", id,
-        name: typeof record.OBJECT_NAME === "string" && record.OBJECT_NAME.trim()
-          ? record.OBJECT_NAME.trim() : `NORAD ${id}`, epochMs, satrec };
+        name: typeof normalized.OBJECT_NAME === "string" && normalized.OBJECT_NAME.trim()
+          ? normalized.OBJECT_NAME.trim() : `NORAD ${id}`, epochMs, satrec };
       // The parser can return an unusable record without throwing.
       if (!Number.isFinite(satrec.no) || satrec.no <= 0 || !eciState(sat, new Date(epochMs))) continue;
       sats.push(sat);
@@ -279,14 +283,29 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
   if (signal?.aborted) ctrl.abort();
   const timer = setTimeout(abort, 15000);
   try {
-    const res = await fetch(def.url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`Data request failed (${res.status})`);
-    const { sats, rejectedCount } = parseOmm(await res.json());
-    if (!sats.length) throw new Error("No usable orbital records");
-    const fetched = Date.parse(res.headers.get("X-Fetched-At") ?? "");
+    let firstError: unknown;
+    try {
+      const res = await fetch(def.url, { signal: ctrl.signal });
+      if (!res.ok) throw new Error(`OMM request failed (${res.status})`);
+      const { sats, rejectedCount } = parseOmm(await res.json());
+      if (!sats.length) throw new Error("No usable OMM records");
+      const fetched = Date.parse(res.headers.get("X-Fetched-At") ?? "");
+      return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
+        servedStale: res.headers.get("X-Served-Stale") === "1",
+        rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
+    } catch (error) {
+      firstError = error;
+    }
+    // Compatibility path for a previous Worker deployment that still exposes
+    // /api/tle, and a server-side OMM outage. This keeps observed data live while
+    // retaining the modern OMM path whenever it is available.
+    const legacy = await fetch(def.legacyUrl, { signal: ctrl.signal });
+    if (!legacy.ok) throw firstError ?? new Error(`TLE request failed (${legacy.status})`);
+    const sats = parseTle(await legacy.text());
+    if (!sats.length) throw firstError ?? new Error("No usable TLE records");
+    const fetched = Date.parse(legacy.headers.get("X-Fetched-At") ?? "");
     return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
-      servedStale: res.headers.get("X-Served-Stale") === "1",
-      rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
+      servedStale: legacy.headers.get("X-Served-Stale") === "1", rejectedCount: 0 };
   } catch (error) {
     if (signal?.aborted) throw error;
     return { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
@@ -295,6 +314,26 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
   }
+}
+
+function parseTle(text: string): Sat[] {
+  const lines = text.split(/\r?\n/).map(line => line.trimEnd()).filter(Boolean);
+  const sats: Sat[] = [];
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (!lines[i].startsWith('1 ') || !lines[i + 1].startsWith('2 ')) continue;
+    const name = i > 0 && !lines[i - 1].startsWith('1 ') && !lines[i - 1].startsWith('2 ')
+      ? lines[i - 1].trim() : 'UNKNOWN';
+    try {
+      const satrec = satlib.twoline2satrec(lines[i], lines[i + 1]);
+      const id = String(satrec.satnum);
+      const epochMs = Number.isFinite(satrec.jdsatepoch)
+        ? (satrec.jdsatepoch - 2440587.5) * 86400000
+        : Date.now();
+      if (Number.isFinite(satrec.no) && satrec.no > 0) sats.push({ kind: 'sgp4', id, name, epochMs, satrec });
+    } catch { /* skip malformed legacy element sets */ }
+    i++;
+  }
+  return sats;
 }
 
 export function gmst(date: Date): number {

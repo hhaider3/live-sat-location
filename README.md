@@ -79,7 +79,7 @@ The GitHub Actions workflow runs the checks and dependency audit on pushes and p
 
 ## Data and freshness
 
-`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. A retained copy can be served during outages for up to 30 days, subject to Cloudflare cache eviction. Cache entries are best effort and are not durable storage. Invalid responses never replace a good cached copy. Upstream requests time out after 10 seconds.
+`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. A retained copy can be served during outages for up to 30 days, subject to Cloudflare cache eviction. Cache entries are best effort and are not durable storage. Invalid responses never replace a good cached copy. Upstream requests time out after 10 seconds. `/api/tle` remains available as a rolling-deployment compatibility endpoint; the client tries it automatically when an older Worker is still serving the site or the OMM route is temporarily unavailable.
 
 Responses preserve `X-Fetched-At`, indicate stale fallback through `X-Served-Stale`, and report rejected records. The client validates elements again, checks propagation at the element epoch, deduplicates catalog IDs within each group, and ignores nonfinite states. Bare OMM epochs are interpreted as UTC.
 

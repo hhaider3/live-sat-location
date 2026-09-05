@@ -62,6 +62,22 @@ test('client preserves stale/fetch headers and falls back on invalid JSON', asyn
   assert.equal(dataFreshness(await loadGroup(GROUP_DEFS[7])), 'Simulated');
 });
 
+test('client falls back to a previous Worker TLE route when the OMM route is unavailable', async t => {
+  let requests: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL) => {
+    requests.push(String(url));
+    if (String(url).includes('/api/omm')) return new Response('deployment not ready', { status: 404 });
+    return new Response(`${tle[0]}\n${tle[1]}\n`, { headers: {
+      'X-Fetched-At': new Date(epoch).toISOString(), 'X-Served-Stale': '0',
+    } });
+  });
+  const result = await loadGroup(GROUP_DEFS[7]);
+  assert.equal(result.sats.length, 1);
+  assert.equal(result.sats[0].id, '25544');
+  assert.equal(result.servedStale, false);
+  assert.deepEqual(requests.map(url => url.includes('/api/omm') ? 'omm' : 'tle'), ['omm', 'tle']);
+});
+
 test('unmounted client requests abort rather than publishing synthetic fallback', async t => {
   const ctrl = new AbortController(); ctrl.abort();
   t.mock.method(globalThis, 'fetch', async (_url, options) => { options.signal.throwIfAborted(); return new Response(); });
