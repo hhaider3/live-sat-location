@@ -1,11 +1,13 @@
 import * as satlib from "satellite.js";
+import { epochMillis, validOmm } from "../shared/omm";
 
 // ---------- Types ----------
 
 export type Sat =
-  | { kind: "sgp4"; name: string; satrec: satlib.SatRec }
+  | { kind: "sgp4"; id: string; name: string; epochMs: number; satrec: satlib.SatRec }
   | {
       kind: "kepler";
+      id: string;
       name: string;
       radiusKm: number;
       inc: number; // rad
@@ -24,7 +26,10 @@ export interface GroupDef {
 
 export interface LoadedGroup extends GroupDef {
   sats: Sat[];
-  live: boolean; // true if real TLE data was fetched
+  fetchedAt: number | null;
+  servedStale: boolean;
+  rejectedCount: number;
+  error?: string;
 }
 
 const KEPLER_EPOCH_MS = Date.UTC(2024, 0, 1);
@@ -41,7 +46,7 @@ export function eciPosition(sat: Sat, date: Date): { x: number; y: number; z: nu
     try {
       const pv = satlib.propagate(sat.satrec, date);
       const p = pv?.position;
-      if (!p || typeof p === "boolean" || !isFinite(p.x)) return null;
+      if (!p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite)) return null;
       return p;
     } catch {
       return null;
@@ -83,8 +88,8 @@ export function eciState(sat: Sat, date: Date): EciState | null {
       const p = pv?.position;
       const v = pv?.velocity;
       if (
-        !p || typeof p === "boolean" || !isFinite(p.x) ||
-        !v || typeof v === "boolean" || !isFinite(v.x)
+        !p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite) ||
+        !v || typeof v === "boolean" || ![v.x, v.y, v.z].every(Number.isFinite)
       ) {
         return null;
       }
@@ -181,7 +186,7 @@ function walker(
     for (let s = 0; s < perPlane; s++) {
       const m0 =
         (2 * Math.PI * s) / perPlane + (2 * Math.PI * phaseF * p) / (planes * perPlane);
-      sats.push({ kind: "kepler", name: `${namePrefix}-${p + 1}-${s + 1}`, radiusKm: r, inc, raan, m0, n });
+      sats.push({ kind: "kepler", id: `sim:${namePrefix}-${p + 1}-${s + 1}`, name: `${namePrefix}-${p + 1}-${s + 1}`, radiusKm: r, inc, raan, m0, n });
     }
   }
   return sats;
@@ -215,7 +220,7 @@ const fallbackOther = (): Sat[] => [
 // ---------- Group catalogue ----------
 
 const CT = (group: string) =>
-  `/api/tle?group=${encodeURIComponent(group)}`;
+  `/api/omm?group=${encodeURIComponent(group)}`;
 
 export const GROUP_DEFS: GroupDef[] = [
   { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), fallback: fallbackStarlink },
@@ -230,51 +235,92 @@ export const GROUP_DEFS: GroupDef[] = [
   { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), fallback: fallbackOther },
 ];
 
-// ---------- TLE fetching / parsing ----------
+// ---------- Validated OMM data and freshness ----------
 
-function parseTle(text: string): Sat[] {
-  const lines = text.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.length > 0);
-  const sats: Sat[] = [];
-  for (let i = 0; i + 2 < lines.length + 1; i++) {
-    if (lines[i].startsWith("1 ") && i + 1 < lines.length && lines[i + 1].startsWith("2 ")) {
-      const name = i > 0 && !lines[i - 1].startsWith("1 ") && !lines[i - 1].startsWith("2 ")
-        ? lines[i - 1].trim()
-        : "UNKNOWN";
-      try {
-        const satrec = satlib.twoline2satrec(lines[i], lines[i + 1]);
-        sats.push({ kind: "sgp4", name, satrec });
-      } catch {
-        /* skip malformed */
-      }
-      i++;
-    }
-  }
-  return sats;
+export type Freshness = "Fresh" | "Stale" | "Simulated";
+export const ELEMENT_AGE_LIMIT_MS = 3.5 * 86400000;
+
+export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): Freshness {
+  const real = sat ? sat.kind === "sgp4" : group.sats.some(s => s.kind === "sgp4");
+  if (!real) return "Simulated";
+  const epochs = sat?.kind === "sgp4" ? [sat.epochMs]
+    : group.sats.flatMap(s => s.kind === "sgp4" ? [s.epochMs] : []);
+  return group.servedStale || group.fetchedAt === null || now - group.fetchedAt > 2 * 3600000 ||
+    epochs.some(epoch => Math.abs(now - epoch) > ELEMENT_AGE_LIMIT_MS) ? "Stale" : "Fresh";
 }
 
-async function fetchWithTimeout(url: string, ms: number): Promise<string> {
+export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } {
+  if (!Array.isArray(data)) throw new Error("Expected an orbital data array");
+  const sats: Sat[] = [];
+  const seen = new Set<string>();
+  for (const record of data) {
+    if (!validOmm(record)) continue;
+    const id = String(record.NORAD_CAT_ID);
+    if (seen.has(id)) continue;
+    try {
+      const epochMs = epochMillis(record.EPOCH);
+      const satrec = satlib.json2satrec({ ...record, EPOCH: new Date(epochMs).toISOString() });
+      const sat: Sat = { kind: "sgp4", id,
+        name: typeof record.OBJECT_NAME === "string" && record.OBJECT_NAME.trim()
+          ? record.OBJECT_NAME.trim() : `NORAD ${id}`, epochMs, satrec };
+      // The parser can return an unusable record without throwing.
+      if (!Number.isFinite(satrec.no) || satrec.no <= 0 || !eciState(sat, new Date(epochMs))) continue;
+      sats.push(sat);
+      seen.add(id);
+    } catch { /* reject invalid elements */ }
+  }
+  return { sats, rejectedCount: data.length - sats.length };
+}
+
+export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<LoadedGroup> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+  const abort = () => ctrl.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) ctrl.abort();
+  const timer = setTimeout(abort, 15000);
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
+    const res = await fetch(def.url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`Data request failed (${res.status})`);
+    const { sats, rejectedCount } = parseOmm(await res.json());
+    if (!sats.length) throw new Error("No usable orbital records");
+    const fetched = Date.parse(res.headers.get("X-Fetched-At") ?? "");
+    return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
+      servedStale: res.headers.get("X-Served-Stale") === "1",
+      rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
+      rejectedCount: 0, error: error instanceof Error ? error.message : "Data unavailable" };
   } finally {
     clearTimeout(timer);
-  }
-}
-
-export async function loadGroup(def: GroupDef): Promise<LoadedGroup> {
-  try {
-    const text = await fetchWithTimeout(def.url, 15000);
-    const sats = parseTle(text);
-    if (sats.length > 0) return { ...def, sats, live: true };
-    throw new Error("empty");
-  } catch {
-    return { ...def, sats: def.fallback(), live: false };
+    signal?.removeEventListener("abort", abort);
   }
 }
 
 export function gmst(date: Date): number {
   return satlib.gstime(date);
+}
+
+export function geographicPosition(sat: Sat, date: Date) {
+  const p = eciPosition(sat, date);
+  if (!p) return null;
+  const gd = satlib.eciToGeodetic(p, gmst(date));
+  if (![gd.latitude, gd.longitude, gd.height].every(Number.isFinite)) return null;
+  return { latitude: gd.latitude * 180 / Math.PI, longitude: gd.longitude * 180 / Math.PI, altitudeKm: gd.height };
+}
+
+/** Surface projection over the next orbit, in Earth-fixed scene coordinates. */
+export function sampleGroundTrack(sat: Sat, date: Date, samples: number, out: Float32Array): boolean {
+  const period = orbitPeriodMin(sat) * 60000;
+  for (let i = 0; i < samples; i++) {
+    const gd = geographicPosition(sat, new Date(date.getTime() + period * i / (samples - 1)));
+    if (!gd) return false;
+    const lat = gd.latitude * Math.PI / 180;
+    const lon = gd.longitude * Math.PI / 180;
+    const r = (R_EARTH + 20) / 1000;
+    out[i * 3] = r * Math.cos(lat) * Math.cos(lon);
+    out[i * 3 + 1] = r * Math.sin(lat);
+    out[i * 3 + 2] = -r * Math.cos(lat) * Math.sin(lon);
+  }
+  return true;
 }

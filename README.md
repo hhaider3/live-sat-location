@@ -2,124 +2,123 @@
 
 ![Earth Orbit Live showing multicolored satellite paths around the planet](public/assets/earth-orbit-social.png)
 
-An interactive 3D visualization of Earth-orbiting satellites, built with React, Three.js, and `satellite.js`. The app loads current TLE data from CelesTrak, propagates live objects with SGP4, and falls back to clearly labeled simulated constellations when a data source is unavailable.
-
-The visualization runs entirely in the browser and requires no backend.
+An interactive 3D satellite explorer built with React, Three.js, and satellite.js. Search the catalog, follow a satellite, explore its orbit and ground track, or calculate passes over a city.
 
 **Live demo:** [live-sat-location.hasanhaider009.workers.dev](https://live-sat-location.hasanhaider009.workers.dev/)
 
+Rendering and orbit propagation run in the browser. A small Cloudflare Worker serves and caches CelesTrak's OMM-compatible JSON feed; without that API, the app uses explicitly labeled simulated constellations.
+
 ## Features
 
-- Interactive 3D Earth with atmosphere, stars, sunlight, and a readable night side
-- Live SGP4 orbit propagation using CelesTrak TLE data
-- Offline simulated-orbit fallbacks for unavailable groups
-- Clear `Live`, `Mixed`, `Offline`, and loading states
-- Starlink, OneWeb, GPS, GLONASS, Galileo, BeiDou, Iridium, space station, geostationary, and science/weather groups
-- Hover any satellite for its name, click it for altitude, velocity, and a full orbit path
-- Per-constellation visibility controls
-- Pause, reverse, date selection, and return-to-now controls
-- Logarithmic speed control from real time to accelerated simulation
-- Responsive phone and desktop layouts
-- Single-file production build for simple static hosting
+- Search by satellite name or catalog ID, including six- and nine-digit IDs
+- Find ISS, follow the selected satellite, and reset the camera
+- Show/hide or isolate a constellation; restore all groups in one click
+- Altitude, inertial velocity, geodetic latitude/longitude, orbital period, and inclination
+- Selected orbit path and Earth-fixed ground track over the next orbit
+- Optional equator and altitude reference rings for LEO, GPS, and GEO
+- Satellite point size/brightness controls and a background-star toggle
+- Independent playback status and Fresh / Stale / Simulated data indicators
+- Element epoch and last successful fetch on the selected satellite
+- Pause, reverse, logarithmic speed presets, local date entry, and an atomic return to live time
+- Geometric pass predictions above 10° elevation over the next 24 hours for preset cities or custom coordinates
+- Responsive panels, keyboard-accessible search, labeled controls, and visible focus indicators
+- Background Web Workers for synchronized catalog propagation and pass calculations
+- Incremental group updates that preserve existing scene objects and selection
+- Single-file application build, including inline Web Workers
 
 ## Controls
 
 | Control | Action |
 | --- | --- |
-| Drag | Rotate the camera around Earth |
-| Scroll or pinch | Zoom in and out |
-| Hover | Show a satellite's name |
-| Click | Select a satellite: name, altitude, velocity, and orbit path |
-| `Esc` or ✕ | Deselect the satellite |
-| Pause/play | Stop or resume simulation time |
-| Forward/reverse | Change the direction of time |
-| Speed slider | Adjust the simulation speed |
-| Speed presets | Select 1×, 60×, 10 min/s, 1 h/s, or 1 d/s |
-| Date and time | Jump to a specific simulation time |
-| Now | Return to the current time |
-| Constellation entry | Show or hide that group |
+| Drag / scroll / pinch | Rotate / zoom |
+| Click a satellite | Show details and its orbit |
+| `/` | Focus satellite search |
+| Arrow down/up in results | Browse search results |
+| Enter | Select a result (or the first match from the search input) |
+| `Esc` | Clear search when searching; otherwise deselect |
+| Space | Pause/play when outside an interactive control |
+| Find ISS | Select the real ISS if available, or the labeled simulated ISS |
+| Follow satellite | Move the camera along with the selected satellite |
+| Reset view | Stop following and return to the initial Earth view |
+| Constellation / ◎ | Toggle visibility / isolate that group |
+| Show all | Restore every constellation, including groups still loading |
+| Return to live | Current time, forward, 1×, unpaused |
+| Jump & pause | Jump to the entered local time and pause |
+| Upcoming passes → View peak | Pause at the predicted pass peak |
 
-The simulation starts at **1× real-time speed**. On phone-sized screens, the constellation panel starts collapsed to leave more room for the visualization.
+The main clock is UTC. Date entry is explicitly labeled with the browser's local timezone. Pass times are UTC. On smaller screens the constellation drawer and extra time controls start collapsed; the satellite detail panel can also be collapsed.
 
-## Getting Started
+## Development
 
-### Requirements
-
-- Node.js 20.19 or newer
-- npm
-- A browser with WebGL support
-
-### Install and run
-
-The app and its TLE API run as two processes. The Vite dev server proxies `/api` to a local Cloudflare Worker, which serves and caches CelesTrak data:
+Node.js 20.19+ and npm are required.
 
 ```bash
 npm ci
 
-# terminal 1 — Worker API on http://127.0.0.1:8787
+# Terminal 1: build assets and start the local Worker API on port 8787
 npm run dev:worker
 
-# terminal 2 — app on http://localhost:5173
+# Terminal 2: Vite app with /api proxied to the Worker
 npm run dev
 ```
 
-Open the local URL printed by Vite, usually `http://localhost:5173`.
+Open the URL printed by Vite, usually [localhost:5173](http://localhost:5173).
 
-Running `npm run dev` without the Worker still works, but every group falls back to simulated orbits because `/api/tle` has nothing to answer.
-
-### Production build
+Without the Worker, the frontend falls back to simulated objects. `npm run preview` previews static assets only; use `npm run dev:worker` and open port 8787 to test the production build with its API. Editing app source requires rebuilding when viewing the Worker's static assets.
 
 ```bash
-npm run build
+npm run check       # TypeScript, focused tests, production build
+npm audit           # dependency advisories
+npm run build       # produces dist/index.html
+npm run deploy      # build and deploy Worker + assets to Cloudflare
 ```
 
-The generated site is written to `dist/`. The build uses `vite-plugin-singlefile`, so the application code and styles are bundled into `dist/index.html`.
+For repeatable UI checks without CelesTrak, run `node scripts/preview-fixtures.mjs` in place of the Worker, then start Vite. This local-only API serves explicitly named test objects, a delayed 12,000-object group, a stale group, and one unavailable group. It is never bundled into the app.
 
-Preview the production build locally with:
+The GitHub Actions workflow runs the checks and dependency audit on pushes and pull requests. Tests use fixed orbital fixtures and mocked upstream/cache responses, so they do not depend on a live data source.
 
-```bash
-npm run preview
-```
+## Data and freshness
 
-## Data and Orbit Model
+`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. A retained copy can be served during outages for up to 30 days, subject to Cloudflare cache eviction. Cache entries are best effort and are not durable storage. Invalid responses never replace a good cached copy. Upstream requests time out after 10 seconds.
 
-Live orbital elements are requested from [CelesTrak](https://celestrak.org/) in TLE format through a same-origin Cloudflare Worker endpoint. Successful responses are cached at the edge for two hours to respect CelesTrak's update schedule and prevent every visitor from downloading the same data directly. If CelesTrak is unreachable, the Worker serves the last good copy it has (up to 30 days old) instead of an error, so an outage degrades data freshness rather than dropping the app to simulation. Live satellite positions are propagated in the browser using [satellite.js](https://github.com/shashwatak/satellite-js) and the SGP4 model.
+Responses preserve `X-Fetched-At`, indicate stale fallback through `X-Served-Stale`, and report rejected records. The client validates elements again, checks propagation at the element epoch, deduplicates catalog IDs within each group, and ignores nonfinite states. Bare OMM epochs are interpreted as UTC.
 
-When a group cannot be fetched or parsed within the request timeout, the app creates a synthetic circular-orbit approximation for that group. Simulated groups are marked with `sim` in the constellation panel and are included in the `Mixed` or `Offline` status rather than being presented as live data.
+- **Fresh:** fetched within two hours, with element epochs within 3.5 days of wall-clock time.
+- **Stale:** old or unknown fetch time, older element epochs, or a cached response served during an outage.
+- **Simulated:** a synthetic circular constellation, not observed satellite positions.
 
-## Technology
+These freshness thresholds are display heuristics, not accuracy guarantees. A separate notice appears when the displayed simulation time is more than 3.5 days from a selected object's epoch. Live time only describes playback. A simulated object's selection and pass panels always identify it as simulated.
 
-- [React](https://react.dev/) for the interface and application state
-- [Three.js](https://threejs.org/) for WebGL rendering
-- [satellite.js](https://github.com/shashwatak/satellite-js) for TLE parsing and SGP4 propagation
-- [Tailwind CSS](https://tailwindcss.com/) for styling
-- [Vite](https://vite.dev/) for development and production builds
-- TypeScript for static type checking
+Groups refresh every two hours while visible and after returning to an expired catalog, with a manual refresh control. If a refresh fails, an already loaded observed group is retained and marked stale instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
 
-## Project Structure
+OMM avoids the legacy TLE catalog-number limit. See [CelesTrak's GP formats documentation](https://celestrak.org/NORAD/documentation/gp-data-formats.php) and [satellite.js](https://github.com/shashwatak/satellite-js).
+
+## Simulation model
+
+All visible groups are propagated in a Web Worker at the same pair of timestamps. Complete snapshots are published together, and the renderer uses one interpolation fraction for the entire catalog. Snapshot intervals are capped at 30 simulated seconds to limit straight-line interpolation error. At extreme playback speeds the view skips ahead between snapshots rather than interpolating across long orbital arcs. Displayed time, Earth rotation, and selected-object details follow the rendered snapshot. The simulation clock uses wall-clock anchors to avoid cumulative frame drift and recover after backgrounding. A synchronous snapshot fallback is available if Web Workers cannot start.
+
+The Earth is rendered as a mean-radius sphere; latitude, longitude, and altitude use satellite.js's geodetic conversion. Guide rings illustrate equatorial radii, not orbital boundaries in every direction. The selected ground track projects future positions onto the rotating globe. The blue-marble texture is loaded from a CDN, with a procedural fallback if unavailable.
+
+Pass predictions scan the next 24 hours at 10-second intervals, refine threshold crossings to about half a second, and report peak elevation at the sampling resolution. They assume a sea-level observer and a 10° minimum elevation. Daylight, clouds, terrain, and satellite illumination are not modeled; a geometric pass is not a promise of naked-eye visibility. Predictions are calculated on demand from the displayed time and must be recalculated after changing it. Simulated pass predictions are illustrative only.
+
+This project is for visualization and education. Do not use it for navigation, conjunction assessment, or spacecraft operations.
+
+## Structure
 
 ```text
 src/
-├── App.tsx         # Interface, controls, loading state, and constellation visibility
-├── engine.ts       # Three.js scene, animation loop, rendering, and resource cleanup
-├── satellites.ts   # TLE loading, SGP4 propagation, and simulated fallbacks
-├── index.css       # Tailwind CSS entry point
-└── main.tsx        # React application entry point
-worker/
-└── index.js        # Cached, same-origin proxy for CelesTrak TLE data
-wrangler.jsonc      # Cloudflare Worker and static-assets configuration
-```
-
-## Accuracy Notice
-
-This project is intended for visualization and educational use. TLE-based positions are approximate and depend on the age and quality of the source elements. Simulated fallback objects do not represent current real-world satellite positions. Do not use this application for navigation, conjunction assessment, spacecraft operations, or other safety-critical decisions.
-
-## Contributing
-
-Issues and pull requests are welcome. For code changes, verify the project before submitting:
-
-```bash
-npx tsc --noEmit
-npm run build
-npm audit
+  App.tsx                 Interface, search, data lifecycle, and playback controls
+  PassPlanner.tsx         City/coordinate input and pass results
+  engine.ts               Three.js rendering, selection, tracking, and overlays
+  satellites.ts           OMM ingestion, freshness, propagation, and synthetic groups
+  propagation.ts          Timestamped snapshots and interpolation
+  propagation.worker.ts   Background catalog propagation
+  passes.ts               Geometric pass calculation
+  passes.worker.ts        Background pass calculation
+  time.ts                 Anchored simulation clock
+shared/omm.ts             Shared orbital record validation
+worker/index.js           Cloudflare request routing
+worker/proxy.js           Cached CelesTrak JSON proxy
+scripts/test.mjs          Isolated test build and runner
+tests/                   Orbital, playback, and proxy regression tests
 ```

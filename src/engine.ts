@@ -6,9 +6,16 @@ import {
   Sat,
   eciPosition,
   eciState,
+  geographicPosition,
+  orbitPeriodMin,
+  sampleGroundTrack,
   gmst,
   sampleOrbitPath,
 } from "./satellites";
+
+import PropagationWorker from './propagation.worker?worker&inline';
+import { buildSnapshot, interpolatePositions, snapshotTime, type PropagationRequest, type Snapshot } from './propagation';
+import { SimulationClock } from './time';
 
 const KM_TO_UNITS = 1 / 1000; // 1 scene unit = 1000 km
 const EARTH_RADIUS = 6371 * KM_TO_UNITS;
@@ -21,6 +28,8 @@ interface GroupRender {
   sats: Sat[];
   points: THREE.Points;
   positions: Float32Array;
+  data: LoadedGroup;
+  baseSize: number;
 }
 
 export interface SatSelection {
@@ -28,6 +37,12 @@ export interface SatSelection {
   label: string;
   color: string;
   name: string;
+  id: string;
+  latitude: number;
+  longitude: number;
+  periodMin: number;
+  inclination: number;
+  following: boolean;
   altitudeKm: number;
   velocityKmS: number;
 }
@@ -39,9 +54,23 @@ export interface Engine {
   setPaused(paused: boolean): void;
   setTime(ms: number): void;
   getTime(): number;
+  returnToLive(): void;
+  selectSatellite(key: string, id: string): void;
+  setFollowing(follow: boolean): void;
+  resetView(): void;
+  setDisplay(options: DisplayOptions): void;
   clearSelection(): void;
   dispose(): void;
 }
+
+export interface DisplayOptions {
+  pointSize: number;
+  brightness: number;
+  stars: boolean;
+  groundTrack: boolean;
+  guides: boolean;
+}
+export const DEFAULT_DISPLAY: DisplayOptions = { pointSize: 0.85, brightness: 0.75, stars: true, groundTrack: true, guides: false };
 
 // ---------- Procedural fallback earth texture ----------
 function proceduralEarthTexture(): THREE.Texture {
@@ -90,7 +119,7 @@ function makeStars(): THREE.Points {
     size: 1.6,
     sizeAttenuation: false,
     transparent: true,
-    opacity: 0.75,
+    opacity: 0.35,
     depthWrite: false,
   });
   return new THREE.Points(geo, mat);
@@ -118,6 +147,8 @@ export function createEngine(
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(container.clientWidth, container.clientHeight);
   container.appendChild(renderer.domElement);
+  renderer.domElement.setAttribute("aria-label", "3D Earth and satellite orbits. Use satellite search to select an object with the keyboard.");
+  renderer.domElement.setAttribute("role", "img");
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x01020a);
@@ -129,7 +160,7 @@ export function createEngine(
     0.05,
     6000
   );
-  camera.position.set(18, 10, 22);
+  camera.position.set(18, 10, 22).multiplyScalar(Math.max(1, 0.7 / camera.aspect));
 
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -196,8 +227,7 @@ export function createEngine(
 
   // ---------- Satellite groups ----------
   let groupRenders: GroupRender[] = [];
-  let flat: { g: GroupRender; i: number }[] = [];
-  let cursor = 0;
+  let display = { ...DEFAULT_DISPLAY };
 
   function circleSprite(): THREE.Texture {
     const c = document.createElement("canvas");
@@ -233,58 +263,103 @@ export function createEngine(
       (gr.points.material as THREE.Material).dispose();
     }
     groupRenders = [];
-    flat = [];
+
   }
 
   function setGroups(groups: LoadedGroup[]) {
     if (disposed) return;
-    clearGroupRenders();
-    const now = new Date(simTime);
-    for (const g of groups) {
-      const positions = new Float32Array(g.sats.length * 3);
-      const v = new THREE.Vector3();
-      for (let i = 0; i < g.sats.length; i++) {
-        const p = eciPosition(g.sats[i], now);
-        if (p) {
-          eciToScene(p, v);
-          positions.set([v.x, v.y, v.z], i * 3);
-        } else {
-          positions.set([HIDDEN, HIDDEN, HIDDEN], i * 3);
-        }
+    const previous = selected ? { key: selected.g.key, id: selected.g.sats[selected.i].id, following } : null;
+    let changed = false;
+    for (const old of [...groupRenders]) {
+      if (groups.some(g => g.key === old.key && g.sats === old.sats)) {
+        old.data = groups.find(g => g.key === old.key)!;
+        continue;
       }
+      scene.remove(old.points);
+      old.points.geometry.dispose();
+      (old.points.material as THREE.Material).dispose();
+      groupRenders = groupRenders.filter(g => g !== old);
+      propagationWorker?.postMessage({ type: 'remove', key: old.key });
+      changed = true;
+    }
+    for (const g of groups) {
+      if (groupRenders.some(old => old.key === g.key)) continue;
+      const positions = new Float32Array(g.sats.length * 3).fill(HIDDEN);
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      const mat = new THREE.PointsMaterial({
-        color: new THREE.Color(g.color),
-        size: g.key === "stations" ? 9 : g.key === "starlink" ? 3.2 : 4.4,
-        sizeAttenuation: false,
-        map: sprite,
-        transparent: true,
-        opacity: 0.95,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      });
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+      const baseSize = g.key === 'stations' ? 9 : g.key === 'starlink' ? 3.2 : 4.4;
+      const mat = new THREE.PointsMaterial({ color: new THREE.Color(g.color),
+        size: baseSize * display.pointSize, sizeAttenuation: false, map: sprite,
+        transparent: true, opacity: display.brightness, depthWrite: false, blending: THREE.AdditiveBlending });
       const points = new THREE.Points(geo, mat);
       points.frustumCulled = false;
       scene.add(points);
-      const gr: GroupRender = {
-        key: g.key,
-        label: g.label,
-        colorCss: g.color,
-        sats: g.sats,
-        points,
-        positions,
-      };
-      groupRenders.push(gr);
-      for (let i = 0; i < g.sats.length; i++) flat.push({ g: gr, i });
+      groupRenders.push({ key: g.key, label: g.label, colorCss: g.color, sats: g.sats,
+        points, positions, data: g, baseSize });
+      propagationWorker?.postMessage({ type: 'upsert', key: g.key, sats: g.sats });
+      changed = true;
     }
-    cursor = 0;
+    if (previous && !groupRenders.includes(selected!.g)) {
+      const g = groupRenders.find(g => g.key === previous.key);
+      const i = g?.sats.findIndex(s => s.id === previous.id) ?? -1;
+      selectTarget(g && i >= 0 ? { g, i } : null);
+      following = !!selected && previous.following;
+    }
+    if (changed) invalidateSnapshots();
   }
 
-  // ---------- Time control ----------
-  let simTime = Date.now();
-  let speed = 1;
-  let paused = false;
+  // ---------- Time and propagation ----------
+  const clock = new SimulationClock();
+  let simTime = clock.time(); // timestamp shared by all currently rendered objects
+  let snapshot: Snapshot | null = null;
+  let generation = 0;
+  let pending = false;
+  let lastRequest = -Infinity;
+  let propagationWorker: Worker | null = null;
+  try {
+    propagationWorker = new PropagationWorker();
+    propagationWorker.onmessage = (event: MessageEvent<Snapshot>) => {
+      pending = false;
+      if (!disposed && event.data.generation === generation) snapshot = event.data;
+    };
+    propagationWorker.onerror = () => {
+      propagationWorker?.terminate(); propagationWorker = null; pending = false;
+    };
+  } catch { /* same snapshot algorithm remains available without Worker support */ }
+
+  function invalidateSnapshots() {
+    generation++;
+    snapshot = null;
+    lastRequest = -Infinity;
+  }
+
+  function updatePositions(now: number) {
+    const desired = clock.time();
+    const running = !clock.paused;
+    const step = running ? Math.sign(clock.speed) * Math.min(30000, Math.max(1000, Math.abs(clock.speed) * 120)) : 0;
+    const interval = Math.max(16, Math.min(100, 10000 / Math.max(1, Math.abs(clock.speed))));
+    if (!pending && (!snapshot || (running && now - lastRequest >= interval))) {
+      const request: Extract<PropagationRequest, { type: 'sample' }> = {
+        type: 'sample', keys: groupRenders.filter(g => g.points.visible).map(g => g.key),
+        generation, start: desired, end: desired + step,
+      };
+      lastRequest = now;
+      if (propagationWorker) { pending = true; propagationWorker.postMessage(request); }
+      else snapshot = buildSnapshot(new Map(groupRenders.map(g => [g.key, g.sats])), request);
+    }
+    if (!snapshot) {
+      if (!groupRenders.length) simTime = desired;
+      return;
+    }
+    simTime = snapshotTime(snapshot, desired);
+    const alpha = snapshot.end === snapshot.start ? 0 : (simTime - snapshot.start) / (snapshot.end - snapshot.start);
+    for (const pair of snapshot.groups) {
+      const g = groupRenders.find(g => g.key === pair.key);
+      if (!g || g.positions.length !== pair.a.length) continue;
+      interpolatePositions(pair.a, pair.b, alpha, g.positions);
+      (g.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    }
+  }
 
   // ---------- Selection & hover ----------
   const ORBIT_SAMPLES = 256;
@@ -316,6 +391,54 @@ export function createEngine(
 
   let selected: { g: GroupRender; i: number } | null = null;
   let orbitEpochMs = 0;
+  let following = false;
+  const previousTarget = new THREE.Vector3();
+  const trackGeometry = new THREE.BufferGeometry();
+  const trackPositions = new Float32Array(ORBIT_SAMPLES * 3);
+  trackGeometry.setAttribute('position', new THREE.BufferAttribute(trackPositions, 3));
+  const trackMaterial = new THREE.LineBasicMaterial({ color: 0x5eead4, transparent: true, opacity: 0.85 });
+  const track = new THREE.Line(trackGeometry, trackMaterial);
+  track.frustumCulled = false;
+  track.visible = false;
+  scene.add(track);
+
+  const guides = new THREE.Group();
+  for (const [altitude, color] of [[0, 0x5eead4], [2000, 0x38bdf8], [20180, 0xfacc15], [35786, 0xc4b5fd]]) {
+    const r = (R_EARTH + altitude + 15) * KM_TO_UNITS;
+    const points = Array.from({ length: 256 }, (_, i) => new THREE.Vector3(r * Math.cos(i / 256 * Math.PI * 2), 0, r * Math.sin(i / 256 * Math.PI * 2)));
+    guides.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.45 })));
+  }
+  guides.visible = false;
+  scene.add(guides);
+
+  function setFollowing(value: boolean) {
+    following = value && !!selected;
+    if (following && selected) {
+      const p = eciPosition(selected.g.sats[selected.i], new Date(simTime));
+      if (p) {
+        eciToScene(p, previousTarget);
+        controls.target.copy(previousTarget);
+        camera.position.copy(previousTarget).add(previousTarget.clone().normalize().multiplyScalar(12));
+        controls.minDistance = 1;
+      }
+    } else {
+      controls.target.set(0, 0, 0);
+      controls.minDistance = EARTH_RADIUS * 1.15;
+    }
+    controls.update();
+    emitSelection();
+  }
+
+  function resetView() {
+    following = false;
+    controls.target.set(0, 0, 0);
+    camera.position.set(18, 10, 22).multiplyScalar(Math.max(1, 0.7 / camera.aspect));
+    controls.minDistance = EARTH_RADIUS * 1.15;
+    controls.update();
+    emitSelection();
+  }
+
 
   // Engine-owned tooltip so hover never triggers React renders.
   const tooltip = document.createElement("div");
@@ -368,16 +491,17 @@ export function createEngine(
       -((y - rect.top) / rect.height) * 2 + 1
     );
     raycaster.setFromCamera(ndc, camera);
-    raycaster.params.Points.threshold = Math.max(0.1, camera.position.length() * 0.012);
+    raycaster.params.Points.threshold = Math.max(0.1, camera.position.distanceTo(controls.target) * 0.007);
     const hits = raycaster.intersectObjects(
       visible.map((g) => g.points),
       false
     );
     for (const hit of hits) {
-      if (hit.index === undefined || !hit.point) continue;
-      if (isOccludedByEarth(hit.point)) continue;
+      if (hit.index === undefined) continue;
       const g = visible.find((gr) => gr.points === hit.object);
-      if (g) return { g, i: hit.index };
+      if (!g || g.positions[hit.index * 3] >= HIDDEN * 0.5) continue;
+      const actual = new THREE.Vector3().fromArray(g.positions, hit.index * 3);
+      if (!isOccludedByEarth(actual)) return { g, i: hit.index };
     }
     return null;
   }
@@ -400,6 +524,9 @@ export function createEngine(
       orbitEpochMs = simTime;
     }
     orbitLine.visible = ok;
+    const trackOk = display.groundTrack && sampleGroundTrack(sat, new Date(simTime), ORBIT_SAMPLES, trackPositions);
+    track.visible = trackOk;
+    if (trackOk) (trackGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   }
 
   function emitSelection() {
@@ -410,12 +537,19 @@ export function createEngine(
     }
     const sat = selected.g.sats[selected.i];
     const st = eciState(sat, new Date(simTime));
+    const gd = geographicPosition(sat, new Date(simTime));
     onSelect({
       key: selected.g.key,
       label: selected.g.label,
       color: selected.g.colorCss,
       name: sat.name,
-      altitudeKm: st ? Math.hypot(st.x, st.y, st.z) - R_EARTH : NaN,
+      id: sat.id,
+      latitude: gd?.latitude ?? NaN,
+      longitude: gd?.longitude ?? NaN,
+      periodMin: orbitPeriodMin(sat),
+      inclination: (sat.kind === 'sgp4' ? sat.satrec.inclo : sat.inc) * 180 / Math.PI,
+      following,
+      altitudeKm: gd?.altitudeKm ?? NaN,
       velocityKmS: st ? Math.hypot(st.vx, st.vy, st.vz) : NaN,
     });
   }
@@ -425,6 +559,8 @@ export function createEngine(
       selected = null;
       return;
     }
+    const wasFollowing = following;
+    following = false;
     selected = target;
     if (selected) {
       orbitMat.color.set(selected.g.colorCss);
@@ -432,7 +568,9 @@ export function createEngine(
     } else {
       orbitLine.visible = false;
       selectionRing.visible = false;
+      track.visible = false;
     }
+    if (wasFollowing) setFollowing(!!selected);
     emitSelection();
   }
 
@@ -460,7 +598,7 @@ export function createEngine(
     renderer.domElement.style.cursor = "";
   };
   const onKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Escape") selectTarget(null);
+    if (e.key === "Escape" && !(e.target as HTMLElement).closest("input, textarea, select")) selectTarget(null);
   };
   renderer.domElement.addEventListener("pointerdown", onPointerDown);
   renderer.domElement.addEventListener("pointermove", onPointerMove);
@@ -495,28 +633,32 @@ export function createEngine(
     } else {
       selectionRing.visible = true;
       selectionRing.position.set(x, selected.g.positions[i3 + 1], selected.g.positions[i3 + 2]);
-      selectionRing.scale.setScalar(camera.position.length() * 0.035);
+      selectionRing.scale.setScalar(camera.position.distanceTo(selectionRing.position) * 0.025);
+      if (following) {
+        camera.position.add(selectionRing.position.clone().sub(previousTarget));
+        controls.target.copy(selectionRing.position);
+        previousTarget.copy(selectionRing.position);
+      }
     }
     if (Math.abs(simTime - orbitEpochMs) > ORBIT_REFRESH_MS) rebuildOrbit();
+    track.rotation.y = gmst(new Date(simTime));
   }
 
   // ---------- Loop ----------
   const timer = new THREE.Timer();
   timer.connect(document);
-  const tmp = new THREE.Vector3();
   let raf = 0;
   let fpsAcc = 0;
   let fpsFrames = 0;
   let fps = 60;
   let lastUi = 0;
 
-  const BATCH = 2600;
 
   function animate(timestamp?: number) {
     raf = requestAnimationFrame(animate);
     timer.update(timestamp);
     const dt = Math.min(timer.getDelta(), 0.25);
-    if (!paused) simTime += dt * 1000 * speed;
+    updatePositions(performance.now());
     const date = new Date(simTime);
 
     // Earth rotation (GMST) — the equirectangular texture's prime meridian is
@@ -526,29 +668,6 @@ export function createEngine(
     // Sun direction
     const s = sunDirectionECI(date);
     sun.position.set(s.x * 100, s.z * 100, -s.y * 100);
-
-    // Propagate a batch of satellites
-    if (flat.length > 0) {
-      const n = Math.min(BATCH, flat.length);
-      const touched = new Set<GroupRender>();
-      for (let k = 0; k < n; k++) {
-        const { g, i } = flat[cursor];
-        cursor = (cursor + 1) % flat.length;
-        if (!g.points.visible) continue;
-        const p = eciPosition(g.sats[i], date);
-        if (p) {
-          eciToScene(p, tmp);
-          g.positions[i * 3] = tmp.x;
-          g.positions[i * 3 + 1] = tmp.y;
-          g.positions[i * 3 + 2] = tmp.z;
-        } else {
-          g.positions[i * 3] = HIDDEN;
-        }
-        touched.add(g);
-      }
-      for (const g of touched)
-        (g.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-    }
 
     updateHover();
     updateSelectionVisuals();
@@ -585,17 +704,44 @@ export function createEngine(
     setGroups,
     setGroupVisible(key, visible) {
       const g = groupRenders.find((r) => r.key === key);
-      if (g) g.points.visible = visible;
+      if (g && g.points.visible !== visible) { g.points.visible = visible; invalidateSnapshots(); }
       if (!visible && selected?.g.key === key) selectTarget(null);
     },
     setSpeed(m) {
-      speed = m;
+      if (clock.speed !== m) { clock.setSpeed(m); invalidateSnapshots(); }
     },
     setPaused(p) {
-      paused = p;
+      if (clock.paused !== p) { clock.setPaused(p); invalidateSnapshots(); }
     },
-    setTime(ms) {
-      simTime = ms;
+    setTime(ms) { clock.setTime(ms); invalidateSnapshots(); orbitEpochMs = -Infinity; },
+    returnToLive() { clock.returnToLive(); invalidateSnapshots(); orbitEpochMs = -Infinity; },
+    selectSatellite(key, id) {
+      const g = groupRenders.find(g => g.key === key);
+      const i = g?.sats.findIndex(s => s.id === id) ?? -1;
+      if (!g || i < 0) return;
+      selectTarget({ g, i });
+      if (!following) {
+        const p = eciPosition(g.sats[i], new Date(simTime));
+        if (p) {
+          const v = new THREE.Vector3(); eciToScene(p, v);
+          controls.target.set(0, 0, 0);
+          camera.position.copy(v).normalize().multiplyScalar(Math.max(18, v.length() * 1.7));
+          controls.update();
+        }
+      }
+    },
+    setFollowing,
+    resetView,
+    setDisplay(options) {
+      display = { ...options };
+      stars.visible = display.stars;
+      guides.visible = display.guides;
+      for (const g of groupRenders) {
+        const mat = g.points.material as THREE.PointsMaterial;
+        mat.size = g.baseSize * display.pointSize;
+        mat.opacity = display.brightness;
+      }
+      if (selected) rebuildOrbit();
     },
     getTime() {
       return simTime;
@@ -607,6 +753,7 @@ export function createEngine(
       if (disposed) return;
       disposed = true;
       cancelAnimationFrame(raf);
+      propagationWorker?.terminate();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKeyDown);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
@@ -628,6 +775,10 @@ export function createEngine(
       ringMat.dispose();
       orbitGeometry.dispose();
       orbitMat.dispose();
+      trackGeometry.dispose(); trackMaterial.dispose();
+      for (const line of guides.children as THREE.LineLoop[]) {
+        line.geometry.dispose(); (line.material as THREE.Material).dispose();
+      }
       tooltip.remove();
       renderer.dispose();
       renderer.domElement.remove();
