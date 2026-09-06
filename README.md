@@ -83,13 +83,16 @@ The GitHub Actions workflow runs the checks and dependency audit on pushes and p
 
 Responses preserve `X-Fetched-At`, indicate stale fallback through `X-Served-Stale`, and report rejected records. The client validates elements again, checks propagation at the element epoch, deduplicates catalog IDs within each group, and ignores nonfinite states. Bare OMM epochs are interpreted as UTC.
 
-- **Fresh:** fetched within two hours, with element epochs within 3.5 days of wall-clock time.
-- **Stale:** old or unknown fetch time, older element epochs, or a cached response served during an outage.
+- **Fresh elements:** element epoch within 3.5 days of wall-clock time.
+- **Stale elements:** element epoch outside that range.
+- **Mixed elements:** a group contains both fresh and stale elements. The header counts individual satellites, not groups.
 - **Simulated:** a synthetic circular constellation, not observed satellite positions.
+
+Delivery status is separate: recent fetch, refresh due, failed refresh using cached observations, or unknown fetch time. Missing legacy HTTP metadata does not mean the elements themselves are stale. Both endpoints refresh after two hours and retain outage fallbacks for up to 30 days. Legacy entries without fetch timestamps use Last-Modified only to bound retention, never to invent a fetch time. `X-Upstream-Error` distinguishes timeout, HTTP failure, and invalid data when a refresh fails.
 
 These freshness thresholds are display heuristics, not accuracy guarantees. A separate notice appears when the displayed simulation time is more than 3.5 days from a selected object's epoch. Live time only describes playback. A simulated object's selection and pass panels always identify it as simulated.
 
-Groups refresh every two hours while visible and after returning to an expired catalog, with a manual refresh control. If a refresh fails, an already loaded observed group is retained and marked stale instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
+Groups refresh every two hours while visible and after returning to an expired catalog, with a manual refresh control. If a refresh fails, an already loaded observed group is retained with a failed-refresh notice instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
 
 OMM avoids the legacy TLE catalog-number limit. See [CelesTrak's GP formats documentation](https://celestrak.org/NORAD/documentation/gp-data-formats.php) and [satellite.js](https://github.com/shashwatak/satellite-js).
 

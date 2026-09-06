@@ -240,7 +240,7 @@ export const GROUP_DEFS: GroupDef[] = [
 
 // ---------- Validated OMM data and freshness ----------
 
-export type Freshness = "Fresh" | "Stale" | "Simulated";
+export type Freshness = "Fresh" | "Stale" | "Mixed" | "Simulated";
 export const ELEMENT_AGE_LIMIT_MS = 3.5 * 86400000;
 
 export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): Freshness {
@@ -248,8 +248,18 @@ export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): 
   if (!real) return "Simulated";
   const epochs = sat?.kind === "sgp4" ? [sat.epochMs]
     : group.sats.flatMap(s => s.kind === "sgp4" ? [s.epochMs] : []);
-  return group.servedStale || group.fetchedAt === null || now - group.fetchedAt > 2 * 3600000 ||
-    epochs.some(epoch => Math.abs(now - epoch) > ELEMENT_AGE_LIMIT_MS) ? "Stale" : "Fresh";
+  // Element age and delivery/cache age are independent. Missing HTTP metadata
+  // must not turn recent observed elements into stale or synthetic data.
+  const old = epochs.filter(epoch => !Number.isFinite(epoch) || Math.abs(now - epoch) > ELEMENT_AGE_LIMIT_MS).length;
+  return old === epochs.length ? "Stale" : old > 0 ? "Mixed" : "Fresh";
+}
+
+export function deliveryStatus(group: LoadedGroup, now = Date.now()): string {
+  if (!group.sats.some(s => s.kind === 'sgp4')) return group.error ?? 'Observed data unavailable';
+  if (group.servedStale) return 'Refresh failed; using cached observations';
+  if (group.fetchedAt === null) return 'Observed data; fetch time unknown';
+  if (now - group.fetchedAt >= 2 * 3600000) return 'Cached observations; refresh due';
+  return 'Recently fetched observations';
 }
 
 export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } {
@@ -281,7 +291,7 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
   const abort = () => ctrl.abort();
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) ctrl.abort();
-  const timer = setTimeout(abort, 15000);
+  let timer = setTimeout(abort, 15000);
   try {
     let firstError: unknown;
     try {
@@ -296,16 +306,26 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
     } catch (error) {
       firstError = error;
     }
+    // Each request gets its own timeout. An OMM timeout must not abort the
+    // compatibility request before it starts. Caller cancellation still wins.
+    clearTimeout(timer);
+    if (signal?.aborted) throw firstError;
+    const legacyController = new AbortController();
+    const abortLegacy = () => legacyController.abort();
+    signal?.addEventListener('abort', abortLegacy, { once: true });
+    timer = setTimeout(abortLegacy, 15000);
     // Compatibility path for a previous Worker deployment that still exposes
     // /api/tle, and a server-side OMM outage. This keeps observed data live while
     // retaining the modern OMM path whenever it is available.
-    const legacy = await fetch(def.legacyUrl, { signal: ctrl.signal });
-    if (!legacy.ok) throw firstError ?? new Error(`TLE request failed (${legacy.status})`);
-    const sats = parseTle(await legacy.text());
-    if (!sats.length) throw firstError ?? new Error("No usable TLE records");
-    const fetched = Date.parse(legacy.headers.get("X-Fetched-At") ?? "");
-    return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
-      servedStale: legacy.headers.get("X-Served-Stale") === "1", rejectedCount: 0 };
+    try {
+      const legacy = await fetch(def.legacyUrl, { signal: legacyController.signal });
+      if (!legacy.ok) throw firstError ?? new Error(`TLE request failed (${legacy.status})`);
+      const sats = parseTle(await legacy.text());
+      if (!sats.length) throw firstError ?? new Error("No usable TLE records");
+      const fetched = Date.parse(legacy.headers.get("X-Fetched-At") ?? "");
+      return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
+        servedStale: legacy.headers.get("X-Served-Stale") === "1", rejectedCount: 0 };
+    } finally { signal?.removeEventListener('abort', abortLegacy); }
   } catch (error) {
     if (signal?.aborted) throw error;
     return { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
@@ -326,10 +346,10 @@ function parseTle(text: string): Sat[] {
     try {
       const satrec = satlib.twoline2satrec(lines[i], lines[i + 1]);
       const id = String(satrec.satnum);
-      const epochMs = Number.isFinite(satrec.jdsatepoch)
-        ? (satrec.jdsatepoch - 2440587.5) * 86400000
-        : Date.now();
-      if (Number.isFinite(satrec.no) && satrec.no > 0) sats.push({ kind: 'sgp4', id, name, epochMs, satrec });
+      const epochMs = (satrec.jdsatepoch - 2440587.5) * 86400000;
+      const sat: Sat = { kind: 'sgp4', id, name, epochMs, satrec };
+      if (Number.isFinite(epochMs) && Number.isFinite(satrec.no) && satrec.no > 0 &&
+          eciState(sat, new Date(epochMs))) sats.push(sat);
     } catch { /* skip malformed legacy element sets */ }
     i++;
   }

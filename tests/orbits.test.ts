@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { twoline2satrec, propagate, eciToEcf, ecfToLookAngles } from 'satellite.js';
 import { validOmm, epochMillis } from '../shared/omm';
-import { parseOmm, dataFreshness, loadGroup, GROUP_DEFS, eciPosition, eciState, gmst, geographicPosition, sampleGroundTrack, type LoadedGroup, type Sat } from '../src/satellites';
+import { parseOmm, dataFreshness, deliveryStatus, loadGroup, GROUP_DEFS, eciPosition, eciState, gmst, geographicPosition, sampleGroundTrack, type LoadedGroup, type Sat } from '../src/satellites';
 import { buildSnapshot, interpolatePositions, snapshotTime, HIDDEN_POSITION } from '../src/propagation';
 import { predictPasses } from '../src/passes';
 import { SimulationClock, formatSpeed } from '../src/time';
@@ -42,13 +42,44 @@ test('malformed, duplicate, incompatible, and nonpropagatable records are exclud
   assert.equal(validOmm({ ...issOmm, BSTAR: Infinity }), false);
 });
 
-test('freshness distinguishes stale transport, old epochs, missing metadata, and simulations', () => {
+test('element freshness is independent of transport age and missing legacy metadata', () => {
   assert.equal(dataFreshness(fixtureGroup(), epoch), 'Fresh');
-  assert.equal(dataFreshness({ ...fixtureGroup(), servedStale: true }, epoch), 'Stale');
-  assert.equal(dataFreshness({ ...fixtureGroup(), fetchedAt: null }, epoch), 'Stale');
-  assert.equal(dataFreshness(fixtureGroup(), epoch + 3 * 3600000), 'Stale');
+  assert.equal(dataFreshness({ ...fixtureGroup(), servedStale: true }, epoch), 'Fresh');
+  assert.equal(dataFreshness({ ...fixtureGroup(), fetchedAt: null }, epoch), 'Fresh');
+  assert.equal(dataFreshness(fixtureGroup(), epoch + 3 * 3600000), 'Fresh');
+  assert.match(deliveryStatus({ ...fixtureGroup(), servedStale: true }, epoch), /Refresh failed/);
+  assert.match(deliveryStatus({ ...fixtureGroup(), fetchedAt: null }, epoch), /fetch time unknown/);
   assert.equal(dataFreshness({ ...fixtureGroup(), fetchedAt: epoch + 5 * 86400000 }, epoch + 5 * 86400000), 'Stale');
   assert.equal(dataFreshness({ ...fixtureGroup(), sats: GROUP_DEFS[7].fallback() }, epoch), 'Simulated');
+});
+
+test('one old satellite does not label an entire observed group stale', () => {
+  assert.equal(real.kind, 'sgp4');
+  const old = { ...real, epochMs: epoch - 5 * 86400000 } as Sat;
+  const group = { ...fixtureGroup(), sats: [real, old] };
+  assert.equal(dataFreshness(group, epoch), 'Mixed');
+  assert.equal(dataFreshness(group, epoch, real), 'Fresh');
+  assert.equal(dataFreshness(group, epoch, old), 'Stale');
+});
+
+test('OMM timeout leaves a full independent timeout for the TLE fallback', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('/api/omm')) return new Promise<Response>((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new Error('timeout')));
+      started();
+    });
+    options.signal.throwIfAborted();
+    return new Response(`${tle[0]}\n${tle[1]}\n`);
+  });
+  const pending = loadGroup(GROUP_DEFS[7]);
+  await ready; t.mock.timers.tick(15001);
+  const result = await pending;
+  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.equal(result.fetchedAt, null);
+  assert.equal(dataFreshness(result, epoch), 'Fresh');
 });
 
 test('client preserves stale/fetch headers and falls back on invalid JSON', async t => {

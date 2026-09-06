@@ -33,6 +33,7 @@ h1 > span { color: #7dd3fc; margin-right: 5px; }
 .badge { font-size: 9px; font-weight: 650; padding: 3px 7px; border-radius: 5px; white-space: nowrap; border: 1px solid #ffffff18; background: #ffffff08; color: #b5c1d2; }
 .badge.fresh { background: #064e3b55; color: #6ee7b7; border-color: #6ee7b72b; }
 .badge.stale { background: #78350f45; color: #fcd34d; border-color: #fcd34d30; }
+.badge.mixed { background: #78350f45; color: #fcd34d; border-color: #fcd34d30; }
 .badge.simulated { color: #c4b5fd; background: #4c1d952c; }.badge.playback { color: #7dd3fc; }
 .search-wrap { position: relative; }
 .search-wrap input { padding-right: 30px !important; font-size: 12px; }

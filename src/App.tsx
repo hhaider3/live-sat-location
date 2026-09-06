@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createEngine, DEFAULT_DISPLAY, type Engine, type SatSelection } from './engine';
-import { dataFreshness, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, type LoadedGroup, type Sat } from './satellites';
+import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, type LoadedGroup, type Sat } from './satellites';
 import { formatSpeed } from './time';
 import PassPlanner from './PassPlanner';
 
@@ -15,7 +15,7 @@ const localInput = (ms: number) => {
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 function FreshnessBadge({ status }: { status: ReturnType<typeof dataFreshness> }) {
-  return <span className={`badge ${status.toLowerCase()}`}>{status}</span>;
+  return <span className={`badge ${status.toLowerCase()}`}>{status === 'Simulated' ? status : `${status} elements`}</span>;
 }
 
 export default function App() {
@@ -111,7 +111,7 @@ export default function App() {
   const selectedSat = selectedGroup?.sats.find(s => s.id === selection?.id);
   const isVisible = (key: string) => visibility[key] ?? true;
   const visibleCount = groups.filter(g => isVisible(g.key)).reduce((sum, g) => sum + g.sats.length, 0);
-  const statuses = groups.map(g => dataFreshness(g));
+  const statuses = groups.flatMap(g => g.sats.map(sat => dataFreshness(g, Date.now(), sat)));
   const fresh = statuses.filter(s => s === 'Fresh').length;
   const stale = statuses.filter(s => s === 'Stale').length;
   const simulated = statuses.filter(s => s === 'Simulated').length;
@@ -149,7 +149,7 @@ export default function App() {
       <section className="panel overview" aria-label="Satellite explorer">
         <div className="brand-row"><h1><span aria-hidden="true">◉</span> Earth Orbit</h1><span className={`badge ${isLiveTime ? 'fresh' : 'playback'}`}>{isLiveTime ? 'Live time' : paused ? 'Paused' : 'Playback'}</span></div>
         <p className="intro">Explore the objects moving around our planet.</p>
-        <div className="catalog-summary" aria-live="polite">{loading > 0 ? `Loading ${loading} groups…` : <><span className="fresh-text">{fresh} fresh</span><span className="stale-text">{stale} stale</span><span>{simulated} simulated</span></>}</div>
+        <div className="catalog-summary" aria-live="polite">{loading > 0 ? `Loading ${loading} groups…` : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
         <div className="search-wrap"><label className="sr-only" htmlFor="satellite-search">Search satellites by name or catalog ID</label>
           <input id="satellite-search" ref={search} type="search" autoComplete="off" placeholder="Search name or catalog ID…" value={query}
             aria-controls={query.trim() ? 'search-results' : undefined}
@@ -187,7 +187,7 @@ export default function App() {
           </dl>
           {!Number.isFinite(selection.altitudeKm) && <p className="notice">Position unavailable at this time. Try a time closer to the element epoch.</p>}
           <div className="quick-actions"><button className={`action ${selection.following ? 'active' : ''}`} aria-pressed={selection.following} onClick={() => engine.current?.setFollowing(!selection.following)}>{selection.following ? 'Stop following' : 'Follow satellite'}</button><button className="action" onClick={() => isolate(selection.key)}>Isolate group</button></div>
-          {selectedSat.kind === 'sgp4' ? <div className="data-detail"><p>Element epoch <time>{utc(selectedSat.epochMs)}</time></p><p>Last successful fetch <time>{selectedGroup.fetchedAt === null ? 'Unknown' : utc(selectedGroup.fetchedAt)}</time></p>
+          {selectedSat.kind === 'sgp4' ? <div className="data-detail"><p>Element epoch <time>{utc(selectedSat.epochMs)}</time></p><p>Last successful fetch <time>{selectedGroup.fetchedAt === null ? 'Unknown' : utc(selectedGroup.fetchedAt)}</time></p><p>{deliveryStatus(selectedGroup)}</p>
             {Math.abs(simTime - selectedSat.epochMs) > ELEMENT_AGE_LIMIT_MS && <p className="notice">Displayed time is more than 3.5 days from the elements. This extrapolation may be inaccurate.</p>}</div> : <p className="notice">Synthetic circular orbit. This object does not represent a current real-world position.</p>}
           {display.groundTrack && <p className="muted"><span className="track-key" /> Ground track: surface path over the next orbit.</p>}
           <PassPlanner key={`${selection.key}:${selection.id}:${selectedGroup.fetchedAt}`} sat={selectedSat} getTime={() => engine.current?.getTime() ?? simTime} onJump={jump} />
@@ -203,7 +203,7 @@ export default function App() {
           const g = groups.find(g => g.key === def.key);
           return <li key={def.key}>
             <div className="group-row"><button className={`group-toggle ${isVisible(def.key) ? '' : 'dimmed'}`} aria-label={`${def.label} visibility`} aria-pressed={isVisible(def.key)} onClick={() => setVisible(def.key, !isVisible(def.key))}><span className="dot" style={{ background: def.color }} /><span>{def.label}</span><span className="group-count">{g?.sats.length.toLocaleString() ?? '…'}</span></button><button className="isolate-button" title={`Show only ${def.label}`} aria-label={`Isolate ${def.label}`} onClick={() => isolate(def.key)}>◎</button></div>
-            <div className="group-meta">{g ? <><FreshnessBadge status={dataFreshness(g)} /><span title={g.fetchedAt === null ? g.error : utc(g.fetchedAt)}>{g.fetchedAt === null ? 'No observed data' : `Fetched ${new Date(g.fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}</span></> : 'Loading orbital data…'}</div>
+            <div className="group-meta">{g ? <><FreshnessBadge status={dataFreshness(g)} /><span title={g.fetchedAt === null ? g.error : utc(g.fetchedAt)}>{deliveryStatus(g)}</span></> : 'Loading orbital data…'}</div>
           </li>;
         })}</ul>
         <details className="display-settings"><summary>Display & guides</summary>
@@ -214,7 +214,7 @@ export default function App() {
           <label className="check-label"><input type="checkbox" checked={display.guides} onChange={e => setDisplay(d => ({ ...d, guides: e.target.checked }))} /> Equator & altitude guides</label>
           {display.guides && <ul className="guide-legend"><li style={{ color: '#5eead4' }}>Equator · surface</li><li style={{ color: '#38bdf8' }}>LEO upper boundary · 2,000 km</li><li style={{ color: '#facc15' }}>GPS reference · 20,180 km</li><li style={{ color: '#c4b5fd' }}>GEO reference · 35,786 km</li><li className="muted">Equatorial reference rings; zoom out to see higher orbits.</li></ul>}
         </details>
-        <details className="data-help"><summary>About the data</summary><p>Fresh: fetched within 2 hours and all element epochs within 3.5 days of now. Stale: an older fetch, older elements, or an outage fallback. These are display thresholds, not accuracy guarantees.</p><p>Simulation time is separate from data freshness. Synthetic groups are always marked Simulated.</p><p>Coordinates use a geodetic Earth model; the globe and guides use a mean-radius sphere. Speeds are relative to an Earth-centered inertial frame.</p><p><a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">CelesTrak OMM data</a> · SGP4 propagation</p>{groups.some(g => g.rejectedCount) && <p>{groups.reduce((n, g) => n + g.rejectedCount, 0)} invalid or duplicate records excluded.</p>}</details>
+        <details className="data-help"><summary>About the data</summary><p>Fresh elements: epoch within 3.5 days of now. Stale elements: epoch outside that range. Mixed elements: a group contains both. The summary counts individual satellites. Fetch age and failed refreshes are shown separately; fetching an old orbit again does not make its elements fresh. These are display thresholds, not accuracy guarantees.</p><p>Simulation time is separate from data freshness. Synthetic groups are always marked Simulated.</p><p>Coordinates use a geodetic Earth model; the globe and guides use a mean-radius sphere. Speeds are relative to an Earth-centered inertial frame.</p><p><a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">CelesTrak OMM data</a> · SGP4 propagation</p>{groups.some(g => g.rejectedCount) && <p>{groups.reduce((n, g) => n + g.rejectedCount, 0)} invalid or duplicate records excluded.</p>}</details>
       </div>}
     </aside>
 

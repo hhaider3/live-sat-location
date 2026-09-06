@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../worker/index.js';
-import { fetchOmm, STALE_TTL_SECONDS } from '../worker/proxy.js';
-import { issOmm } from './fixtures';
+import { fetchOmm, fetchTle, STALE_TTL_SECONDS } from '../worker/proxy.js';
+import { issOmm, tle } from './fixtures';
 
 function setup(t: Parameters<Parameters<typeof test>[1]>[0]) {
   const store = new Map<string, Response>();
@@ -43,7 +43,47 @@ test('outage serves last good data without rewriting the original fetch time', a
   assert.equal(response.status, 200); assert.equal(response.headers.get('X-Served-Stale'), '1');
   assert.equal(response.headers.get('X-Fetched-At'), fetched);
   assert.equal(response.headers.get('Cache-Control'), 'public, max-age=60');
+  assert.equal(response.headers.get('X-Upstream-Error'), 'http-429');
   assert.deepEqual(await response.json(), [issOmm]);
+});
+
+test('legacy cache without fetch metadata attempts refresh and preserves outage provenance', async t => {
+  const { store, ctx } = setup(t);
+  const legacyUrl = new URL('https://orbit.test/api/tle?group=stations');
+  const modified = new Date(Date.now() - 86400000).toISOString();
+  store.set(legacyUrl.href, new Response(tle.join('\n'), { headers: { 'Last-Modified': modified } }));
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('offline', { status: 503 }); });
+  const response = await fetchTle(legacyUrl, ctx);
+  assert.equal(calls, 1);
+  assert.equal(response.headers.get('X-Served-Stale'), '1');
+  assert.equal(response.headers.get('X-Fetched-At'), null);
+  assert.equal(response.headers.get('X-Upstream-Error'), 'http-503');
+  assert.equal(await response.text(), tle.join('\n'));
+});
+
+test('TLE refresh replaces old cache, validates the body, and bounds retention', async t => {
+  const { store, ctx, flush } = setup(t);
+  const legacyUrl = new URL('https://orbit.test/api/tle?group=stations');
+  const old = new Date(Date.now() - 3 * 3600000).toISOString();
+  store.set(legacyUrl.href, new Response(tle.join('\n'), { headers: { 'X-Fetched-At': old } }));
+  t.mock.method(globalThis, 'fetch', async () => new Response('<html>maintenance</html>'));
+  const invalid = await fetchTle(legacyUrl, ctx);
+  assert.equal(invalid.headers.get('X-Served-Stale'), '1');
+  assert.equal(invalid.headers.get('X-Fetched-At'), old);
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async () => new Response(tle.join('\n')));
+  const refreshed = await fetchTle(legacyUrl, ctx);
+  assert.equal(refreshed.headers.get('X-Served-Stale'), '0');
+  assert.notEqual(refreshed.headers.get('X-Fetched-At'), old);
+  await flush();
+  assert.equal(store.get(legacyUrl.href)!.headers.get('Cache-Control'), `public, max-age=${STALE_TTL_SECONDS}`);
+  store.set(legacyUrl.href, new Response(tle.join('\n'), { headers: {
+    'Last-Modified': new Date(Date.now() - (STALE_TTL_SECONDS + 1) * 1000).toISOString(),
+  } }));
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async () => new Response('offline', { status: 503 }));
+  assert.equal((await fetchTle(legacyUrl, ctx)).status, 502);
 });
 
 test('malformed successful responses cannot replace cached orbital data', async t => {

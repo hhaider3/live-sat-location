@@ -35,8 +35,12 @@ export async function fetchOmm(requestUrl, ctx) {
   const cached = cache ? await cache.match(key).catch(() => null) : null;
   const age = cached ? Date.now() - Date.parse(cached.headers.get('X-Fetched-At') ?? '') : Infinity;
   if (cached && age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
-  const fallback = () => cached && age >= 0 && age < STALE_TTL_SECONDS * 1000
-    ? clientResponse(cached, true) : errorResponse('Orbital data source is unavailable', 502);
+  const fallback = (reason) => {
+    const response = cached && age >= 0 && age < STALE_TTL_SECONDS * 1000
+      ? clientResponse(cached, true) : errorResponse('Orbital data source is unavailable', 502);
+    response.headers.set('X-Upstream-Error', reason);
+    return response;
+  };
 
   const upstreamUrl = new URL('https://celestrak.org/NORAD/elements/gp.php');
   upstreamUrl.searchParams.set('GROUP', group);
@@ -48,11 +52,11 @@ export async function fetchOmm(requestUrl, ctx) {
       Accept: 'application/json',
       'User-Agent': 'live-sat-location/2.0 (+https://github.com/hhaider3/live-sat-location)',
     } });
-    if (!upstream.ok) return fallback();
+    if (!upstream.ok) return fallback(`http-${upstream.status}`);
     const data = await upstream.json();
-    if (!Array.isArray(data)) return fallback();
+    if (!Array.isArray(data)) return fallback('invalid-data');
     const records = data.map(normalizeOmm).filter(Boolean);
-    if (!records.length) return fallback();
+    if (!records.length) return fallback('invalid-data');
     const response = new Response(JSON.stringify(records), { headers: {
       'Cache-Control': `public, max-age=${STALE_TTL_SECONDS}`,
       'Content-Type': 'application/json; charset=utf-8',
@@ -64,7 +68,7 @@ export async function fetchOmm(requestUrl, ctx) {
     if (cache) ctx.waitUntil(cache.put(key, response.clone()).catch(() => {}));
     return clientResponse(response);
   } catch {
-    return fallback();
+    return fallback(controller.signal.aborted ? 'timeout' : 'request-or-parse-failed');
   } finally {
     clearTimeout(timer);
   }
@@ -79,7 +83,19 @@ export async function fetchTle(requestUrl, ctx) {
   const key = new Request(new URL(`/api/tle?group=${encodeURIComponent(group)}`, requestUrl.origin));
   const cache = getCache();
   const cached = cache ? await cache.match(key).catch(() => null) : null;
-  if (cached) return clientResponse(cached);
+  const fetched = Date.parse(cached?.headers.get('X-Fetched-At') ?? '');
+  const age = Date.now() - fetched;
+  if (cached && age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
+  // Old deployments did not attach X-Fetched-At. Last-Modified can bound
+  // fallback retention, but is not a successful fetch time and stays separate.
+  const retentionAge = Number.isFinite(age) ? age
+    : Date.now() - Date.parse(cached?.headers.get('Last-Modified') ?? '');
+  const fallback = (reason) => {
+    const response = cached && retentionAge >= 0 && retentionAge < STALE_TTL_SECONDS * 1000
+      ? clientResponse(cached, true) : errorResponse('Orbital data source is unavailable', 502);
+    response.headers.set('X-Upstream-Error', reason);
+    return response;
+  };
   const upstreamUrl = new URL('https://celestrak.org/NORAD/elements/gp.php');
   upstreamUrl.searchParams.set('GROUP', group);
   upstreamUrl.searchParams.set('FORMAT', 'TLE');
@@ -89,15 +105,17 @@ export async function fetchTle(requestUrl, ctx) {
     const upstream = await fetch(upstreamUrl, { signal: controller.signal, headers: {
       Accept: 'text/plain', 'User-Agent': 'live-sat-location/2.0 (+https://github.com/hhaider3/live-sat-location)',
     } });
-    if (!upstream.ok) return errorResponse('Orbital data source is unavailable', 502);
-    const response = new Response(upstream.body, upstream);
+    if (!upstream.ok) return fallback(`http-${upstream.status}`);
+    const body = await upstream.text();
+    if (!/^1 .+\r?\n2 .+/m.test(body)) return fallback('invalid-data');
+    const response = new Response(body);
     response.headers.set('Content-Type', 'text/plain; charset=utf-8');
-    response.headers.set('Cache-Control', `public, max-age=${CACHE_TTL_SECONDS}`);
+    response.headers.set('Cache-Control', `public, max-age=${STALE_TTL_SECONDS}`);
     response.headers.set('X-Fetched-At', new Date().toISOString());
     response.headers.set('X-Served-Stale', '0');
     if (cache) ctx.waitUntil(cache.put(key, response.clone()).catch(() => {}));
-    return response;
+    return clientResponse(response);
   } catch {
-    return cached ? clientResponse(cached, true) : errorResponse('Orbital data source is unavailable', 502);
+    return fallback(controller.signal.aborted ? 'timeout' : 'request-or-parse-failed');
   } finally { clearTimeout(timer); }
 }
