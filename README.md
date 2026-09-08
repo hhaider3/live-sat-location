@@ -79,6 +79,8 @@ The GitHub Actions workflow runs the checks and dependency audit on pushes and p
 
 ## Data and freshness
 
+Amazon Leo is displayed as **Amazon Leo (Kuiper)** and uses CelesTrak's `kuiper` OMM group. Searching either name finds its satellites. If no observed data is available, this group is marked Unavailable with zero objects; no synthetic Amazon fleet is generated.
+
 `GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. Older cached observations are returned immediately while `ctx.waitUntil` refreshes them in the background. Retention is bounded at 30 days, subject to Cloudflare cache eviction; this is best-effort storage. Invalid responses never replace a good cached copy. Cold upstream requests time out after 10 seconds; background refreshes get 25 seconds without delaying the response. `/api/tle` remains a compatibility fallback, but the client respects `Retry-After` instead of making a second request to an unavailable provider.
 
 Refresh state is cached separately: timeouts and server errors back off for 15 minutes, and HTTP 403/429 responses for two hours. `X-Refresh-State` distinguishes an ongoing background refresh from a failed one. The original `X-Fetched-At` never changes on failure. The browser also retains validated OMM responses for up to 30 days and renders them before a new request finishes; storage is optional and synthetic data is never saved.

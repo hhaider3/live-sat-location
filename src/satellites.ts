@@ -237,14 +237,16 @@ export const GROUP_DEFS: GroupDef[] = [
   { key: "stations", label: "Space Stations", color: "#ef4444", url: CT("stations"), legacyUrl: LEGACY_CT("stations"), fallback: fallbackStations },
   { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), legacyUrl: LEGACY_CT("geo"), fallback: fallbackGeo },
   { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), legacyUrl: LEGACY_CT("science"), fallback: fallbackOther },
+  { key: "kuiper", label: "Amazon Leo (Kuiper)", color: "#f59e0b", url: CT("kuiper"), legacyUrl: LEGACY_CT("kuiper"), fallback: () => [] },
 ];
 
 // ---------- Validated OMM data and freshness ----------
 
-export type Freshness = "Fresh" | "Stale" | "Mixed" | "Simulated";
+export type Freshness = "Fresh" | "Stale" | "Mixed" | "Simulated" | "Unavailable";
 export const ELEMENT_AGE_LIMIT_MS = 3.5 * 86400000;
 
 export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): Freshness {
+  if (!sat && !group.sats.length) return 'Unavailable';
   const real = sat ? sat.kind === "sgp4" : group.sats.some(s => s.kind === "sgp4");
   if (!real) return "Simulated";
   const epochs = sat?.kind === "sgp4" ? [sat.epochMs]

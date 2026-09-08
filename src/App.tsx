@@ -15,7 +15,7 @@ const localInput = (ms: number) => {
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 function FreshnessBadge({ status }: { status: ReturnType<typeof dataFreshness> }) {
-  return <span className={`badge ${status.toLowerCase()}`}>{status === 'Simulated' ? status : `${status} elements`}</span>;
+  return <span className={`badge ${status.toLowerCase()}`}>{status === 'Simulated' || status === 'Unavailable' ? status : `${status} elements`}</span>;
 }
 
 export default function App() {
@@ -119,7 +119,7 @@ export default function App() {
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return [];
-    return allSats.filter(({ sat }) => sat.name.toLowerCase().includes(q) || sat.id.toLowerCase().includes(q)).slice(0, 30);
+    return allSats.filter(({ sat, group }) => sat.name.toLowerCase().includes(q) || sat.id.toLowerCase().includes(q) || group.label.toLowerCase().includes(q)).slice(0, 30);
   }, [allSats, query]);
   const selectedGroup = groups.find(g => g.key === selection?.key);
   const selectedSat = selectedGroup?.sats.find(s => s.id === selection?.id);
