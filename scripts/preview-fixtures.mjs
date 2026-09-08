@@ -12,7 +12,7 @@ createServer((req, res) => {
   const group = url.searchParams.get('group');
   const n = (calls.get(group) ?? 0) + 1; calls.set(group, n);
   if (url.pathname !== '/api/omm' || !groups.includes(group)) { res.writeHead(503); res.end('Fixture: unavailable group'); return; }
-  const stale = group === 'oneweb';
+  const stale = group === 'oneweb' && n <= 2;
   const fetchedAt = new Date(now - (stale ? 3 * 3600000 : 0)).toISOString();
   const count = group === 'starlink' ? 12000 : 1;
   const records = Array.from({ length: count }, (_, i) => ({ ...current,
@@ -24,7 +24,8 @@ createServer((req, res) => {
   }));
   setTimeout(() => {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
-      'X-Fetched-At': fetchedAt, 'X-Served-Stale': stale ? '1' : '0' });
+      'X-Fetched-At': fetchedAt, 'X-Served-Stale': stale ? '1' : '0',
+      'X-Refresh-State': stale ? 'revalidating' : 'ready' });
     res.end(JSON.stringify(records));
   }, group === 'starlink' && n <= 2 ? 6000 : 0);
 }).listen(8787, '127.0.0.1', () => console.log('TEST FIXTURES ONLY — API on http://127.0.0.1:8787; run npm run dev for the app.'));

@@ -79,7 +79,9 @@ The GitHub Actions workflow runs the checks and dependency audit on pushes and p
 
 ## Data and freshness
 
-`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. A retained copy can be served during outages for up to 30 days, subject to Cloudflare cache eviction. Cache entries are best effort and are not durable storage. Invalid responses never replace a good cached copy. Upstream requests time out after 10 seconds. `/api/tle` remains available as a rolling-deployment compatibility endpoint; the client tries it automatically when an older Worker is still serving the site or the OMM route is temporarily unavailable.
+`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. Older cached observations are returned immediately while `ctx.waitUntil` refreshes them in the background. Retention is bounded at 30 days, subject to Cloudflare cache eviction; this is best-effort storage. Invalid responses never replace a good cached copy. Cold upstream requests time out after 10 seconds; background refreshes get 25 seconds without delaying the response. `/api/tle` remains a compatibility fallback, but the client respects `Retry-After` instead of making a second request to an unavailable provider.
+
+Refresh state is cached separately: timeouts and server errors back off for 15 minutes, and HTTP 403/429 responses for two hours. `X-Refresh-State` distinguishes an ongoing background refresh from a failed one. The original `X-Fetched-At` never changes on failure. The browser also retains validated OMM responses for up to 30 days and renders them before a new request finishes; storage is optional and synthetic data is never saved.
 
 Responses preserve `X-Fetched-At`, indicate stale fallback through `X-Served-Stale`, and report rejected records. The client validates elements again, checks propagation at the element epoch, deduplicates catalog IDs within each group, and ignores nonfinite states. Bare OMM epochs are interpreted as UTC.
 
@@ -92,7 +94,7 @@ Delivery status is separate: recent fetch, refresh due, failed refresh using cac
 
 These freshness thresholds are display heuristics, not accuracy guarantees. A separate notice appears when the displayed simulation time is more than 3.5 days from a selected object's epoch. Live time only describes playback. A simulated object's selection and pass panels always identify it as simulated.
 
-Groups refresh every two hours while visible and after returning to an expired catalog, with a manual refresh control. If a refresh fails, an already loaded observed group is retained with a failed-refresh notice instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
+Fresh groups become due after two hours. While visible, the client checks pending background refreshes every 30 seconds and failed/expired groups at most every five minutes; the Worker enforces the longer upstream cooldown. Manual refresh still respects that cooldown. If a refresh fails, an already loaded observed group is retained with a failed-refresh notice instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
 
 OMM avoids the legacy TLE catalog-number limit. See [CelesTrak's GP formats documentation](https://celestrak.org/NORAD/documentation/gp-data-formats.php) and [satellite.js](https://github.com/shashwatak/satellite-js).
 

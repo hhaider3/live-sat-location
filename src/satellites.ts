@@ -29,6 +29,7 @@ export interface LoadedGroup extends GroupDef {
   sats: Sat[];
   fetchedAt: number | null;
   servedStale: boolean;
+  refreshState?: string;
   rejectedCount: number;
   error?: string;
 }
@@ -256,6 +257,7 @@ export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): 
 
 export function deliveryStatus(group: LoadedGroup, now = Date.now()): string {
   if (!group.sats.some(s => s.kind === 'sgp4')) return group.error ?? 'Observed data unavailable';
+  if (group.refreshState === 'revalidating') return 'Cached observations; refreshing in background';
   if (group.servedStale) return 'Refresh failed; using cached observations';
   if (group.fetchedAt === null) return 'Observed data; fetch time unknown';
   if (now - group.fetchedAt >= 2 * 3600000) return 'Cached observations; refresh due';
@@ -286,7 +288,36 @@ export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } 
   return { sats, rejectedCount: data.length - sats.length };
 }
 
-export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<LoadedGroup> {
+const LOCAL_CACHE = 'orbit-observations-v1';
+
+// Persist only observed OMM responses. Storage denial/eviction is harmless;
+// neither synthetic fallback nor a failed request can overwrite this copy.
+async function savedResponse(def: GroupDef): Promise<Response | undefined> {
+  try {
+    const cache = await caches.open(LOCAL_CACHE);
+    const response = await cache.match(def.url);
+    const age = Date.now() - Date.parse(response?.headers.get('X-Fetched-At') ?? '');
+    return response && age >= 0 && age < 30 * 86400000 ? response : undefined;
+  } catch { return undefined; }
+}
+
+export async function loadGroup(def: GroupDef, signal?: AbortSignal,
+  onCached?: (group: LoadedGroup) => void): Promise<LoadedGroup> {
+  let saved: LoadedGroup | undefined;
+  if (onCached) {
+    const response = await savedResponse(def);
+    if (signal?.aborted) throw new Error('Aborted');
+    if (response) {
+      try {
+        const parsed = parseOmm(await response.json());
+        if (parsed.sats.length) {
+          saved = { ...def, ...parsed, fetchedAt: Date.parse(response.headers.get('X-Fetched-At')!),
+            servedStale: true, refreshState: 'revalidating' };
+          onCached(saved);
+        }
+      } catch { /* ignore corrupt/old browser cache */ }
+    }
+  }
   const ctrl = new AbortController();
   const abort = () => ctrl.abort();
   signal?.addEventListener("abort", abort, { once: true });
@@ -295,13 +326,23 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
   try {
     let firstError: unknown;
     try {
-      const res = await fetch(def.url, { signal: ctrl.signal });
+      const res = await fetch(def.url, { signal: ctrl.signal, cache: 'no-cache' });
+      // The Worker has already tried the source and scheduled a retry. Asking
+      // the same provider for TLEs would add another timeout and another error.
+      if (!res.ok && res.headers.has('Retry-After')) {
+        return saved ? { ...saved, refreshState: 'failed' }
+          : { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
+            rejectedCount: 0, error: 'Orbital source unavailable; retry scheduled' };
+      }
       if (!res.ok) throw new Error(`OMM request failed (${res.status})`);
+      const toSave = res.clone();
       const { sats, rejectedCount } = parseOmm(await res.json());
       if (!sats.length) throw new Error("No usable OMM records");
+      void (async () => { try { await (await caches.open(LOCAL_CACHE)).put(def.url, toSave); } catch { /* optional storage */ } })();
       const fetched = Date.parse(res.headers.get("X-Fetched-At") ?? "");
       return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
         servedStale: res.headers.get("X-Served-Stale") === "1",
+        refreshState: res.headers.get('X-Refresh-State') ?? undefined,
         rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
     } catch (error) {
       firstError = error;
@@ -328,6 +369,7 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal): Promise<Lo
     } finally { signal?.removeEventListener('abort', abortLegacy); }
   } catch (error) {
     if (signal?.aborted) throw error;
+    if (saved) return { ...saved, refreshState: 'failed', error: error instanceof Error ? error.message : 'Data unavailable' };
     return { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
       rejectedCount: 0, error: error instanceof Error ? error.message : "Data unavailable" };
   } finally {

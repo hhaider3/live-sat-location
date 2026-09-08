@@ -55,28 +55,42 @@ export default function App() {
     const controller = new AbortController();
     let cancelled = false;
     let fetching = false;
-    const refresh = async () => {
+    const lastAttempt = new Map<string, number>();
+    const publish = (next: LoadedGroup) => {
+      if (cancelled) return;
+      groupsRef.current = [...groupsRef.current.filter(g => g.key !== next.key), next]
+        .sort((a, b) => GROUP_DEFS.findIndex(g => g.key === a.key) - GROUP_DEFS.findIndex(g => g.key === b.key));
+      scene.setGroups(groupsRef.current);
+      groupsRef.current.forEach(g => scene.setGroupVisible(g.key, visibilityRef.current.get(g.key) ?? true));
+      setGroups([...groupsRef.current]);
+    };
+    const refresh = async (force = false) => {
       if (fetching || cancelled) return;
-      fetching = true; setLoading(GROUP_DEFS.length);
-      await Promise.allSettled(GROUP_DEFS.map(async def => {
+      const due = GROUP_DEFS.filter(def => {
+        const previous = groupsRef.current.find(g => g.key === def.key);
+        if (force || !previous || previous.refreshState === 'revalidating') return true;
+        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= 5 * 60000 &&
+          (previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
+      });
+      if (!due.length) return;
+      fetching = true; setLoading(due.length);
+      await Promise.allSettled(due.map(async def => {
+        lastAttempt.set(def.key, Date.now());
         try {
-          let next = await loadGroup(def, controller.signal);
+          const hasObserved = groupsRef.current.some(g => g.key === def.key && g.sats.some(s => s.kind === 'sgp4'));
+          let next = await loadGroup(def, controller.signal, hasObserved ? undefined : publish);
           if (cancelled) return;
           const previous = groupsRef.current.find(g => g.key === def.key);
           // A transient failed refresh must not replace an observed catalog with invented objects.
-          if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, error: next.error };
-          groupsRef.current = [...groupsRef.current.filter(g => g.key !== def.key), next]
-            .sort((a, b) => GROUP_DEFS.findIndex(g => g.key === a.key) - GROUP_DEFS.findIndex(g => g.key === b.key));
-          scene.setGroups(groupsRef.current);
-          groupsRef.current.forEach(g => scene.setGroupVisible(g.key, visibilityRef.current.get(g.key) ?? true));
-          setGroups([...groupsRef.current]);
+          if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error };
+          publish(next);
         } finally { if (!cancelled) setLoading(count => count - 1); }
       }));
       fetching = false;
     };
-    refreshRef.current = () => { void refresh(); };
+    refreshRef.current = () => { void refresh(true); };
     void refresh();
-    const interval = window.setInterval(() => { if (!document.hidden) void refresh(); }, 2 * 3600000);
+    const interval = window.setInterval(() => { if (!document.hidden) void refresh(); }, 30000);
     const onVisible = () => {
       if (!document.hidden && groupsRef.current.some(g => g.fetchedAt === null || Date.now() - g.fetchedAt >= 2 * 3600000)) void refresh();
     };

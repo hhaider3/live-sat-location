@@ -29,36 +29,42 @@ test('JSON upstream query supports new catalog IDs, caches valid records and can
   assert.equal(first.status, 200); assert.equal(first.headers.get('X-Rejected-Records'), '1');
   assert.equal((await first.json())[0].NORAD_CAT_ID, 100608);
   assert.ok(Number.isFinite(Date.parse(first.headers.get('X-Fetched-At')!)));
-  await flush(); assert.equal(store.size, 1);
+  await flush(); assert.ok(store.has(url.href));
   const second = await fetchOmm(url, ctx);
   assert.equal(second.headers.get('X-Served-Stale'), '0'); assert.equal(calls, 1);
 });
 
 test('outage serves last good data without rewriting the original fetch time', async t => {
-  const { store, ctx } = setup(t);
+  const { store, ctx, flush } = setup(t);
   const fetched = new Date(Date.now() - 3 * 3600000).toISOString();
   store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: { 'X-Fetched-At': fetched } }));
   t.mock.method(globalThis, 'fetch', async () => new Response('rate limited', { status: 429 }));
   const response = await fetchOmm(url, ctx);
   assert.equal(response.status, 200); assert.equal(response.headers.get('X-Served-Stale'), '1');
   assert.equal(response.headers.get('X-Fetched-At'), fetched);
-  assert.equal(response.headers.get('Cache-Control'), 'public, max-age=60');
-  assert.equal(response.headers.get('X-Upstream-Error'), 'http-429');
+  assert.equal(response.headers.get('Cache-Control'), 'no-cache');
+  assert.equal(response.headers.get('X-Refresh-State'), 'revalidating');
   assert.deepEqual(await response.json(), [issOmm]);
+  await flush();
+  const retry = await fetchOmm(url, ctx);
+  assert.equal(retry.headers.get('X-Upstream-Error'), 'http-429');
+  assert.equal(retry.headers.get('X-Refresh-State'), 'failed');
+  assert.equal(retry.headers.get('X-Fetched-At'), fetched);
 });
 
 test('legacy cache without fetch metadata attempts refresh and preserves outage provenance', async t => {
-  const { store, ctx } = setup(t);
+  const { store, ctx, flush } = setup(t);
   const legacyUrl = new URL('https://orbit.test/api/tle?group=stations');
   const modified = new Date(Date.now() - 86400000).toISOString();
   store.set(legacyUrl.href, new Response(tle.join('\n'), { headers: { 'Last-Modified': modified } }));
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('offline', { status: 503 }); });
   const response = await fetchTle(legacyUrl, ctx);
+  await flush();
   assert.equal(calls, 1);
   assert.equal(response.headers.get('X-Served-Stale'), '1');
   assert.equal(response.headers.get('X-Fetched-At'), null);
-  assert.equal(response.headers.get('X-Upstream-Error'), 'http-503');
+  assert.equal((await fetchTle(legacyUrl, ctx)).headers.get('X-Upstream-Error'), 'http-503');
   assert.equal(await response.text(), tle.join('\n'));
 });
 
@@ -69,10 +75,14 @@ test('TLE refresh replaces old cache, validates the body, and bounds retention',
   store.set(legacyUrl.href, new Response(tle.join('\n'), { headers: { 'X-Fetched-At': old } }));
   t.mock.method(globalThis, 'fetch', async () => new Response('<html>maintenance</html>'));
   const invalid = await fetchTle(legacyUrl, ctx);
+  await flush();
   assert.equal(invalid.headers.get('X-Served-Stale'), '1');
   assert.equal(invalid.headers.get('X-Fetched-At'), old);
   t.mock.restoreAll();
+  store.delete(`${legacyUrl}&refresh-state=1`);
   t.mock.method(globalThis, 'fetch', async () => new Response(tle.join('\n')));
+  await fetchTle(legacyUrl, ctx);
+  await flush();
   const refreshed = await fetchTle(legacyUrl, ctx);
   assert.equal(refreshed.headers.get('X-Served-Stale'), '0');
   assert.notEqual(refreshed.headers.get('X-Fetched-At'), old);
@@ -82,19 +92,23 @@ test('TLE refresh replaces old cache, validates the body, and bounds retention',
     'Last-Modified': new Date(Date.now() - (STALE_TTL_SECONDS + 1) * 1000).toISOString(),
   } }));
   t.mock.restoreAll();
+  store.delete(`${legacyUrl}&refresh-state=1`);
   t.mock.method(globalThis, 'fetch', async () => new Response('offline', { status: 503 }));
   assert.equal((await fetchTle(legacyUrl, ctx)).status, 502);
 });
 
 test('malformed successful responses cannot replace cached orbital data', async t => {
-  const { store, ctx } = setup(t);
+  const { store, ctx, flush } = setup(t);
   const fetched = new Date(Date.now() - 4 * 3600000).toISOString();
   store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: { 'X-Fetched-At': fetched } }));
   for (const body of ['<html>maintenance</html>', '{"error":"unavailable"}', '[{"bad":true}]', '[]']) {
+    store.delete(`${url}&refresh-state=1`);
     t.mock.method(globalThis, 'fetch', async () => new Response(body));
     const response = await fetchOmm(url, ctx);
     assert.equal(response.headers.get('X-Served-Stale'), '1');
     assert.deepEqual(await response.json(), [issOmm]);
+    await flush();
+    assert.deepEqual(await store.get(url.href)!.clone().json(), [issOmm]);
     t.mock.restoreAll();
   }
 });
@@ -103,14 +117,15 @@ test('expired fallback and missing fallback return an error', async t => {
   const { store, ctx } = setup(t);
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('offline'); });
   assert.equal((await fetchOmm(url, ctx)).status, 502);
+  store.clear();
   store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: {
     'X-Fetched-At': new Date(Date.now() - (STALE_TTL_SECONDS + 1) * 1000).toISOString(),
   } }));
   assert.equal((await fetchOmm(url, ctx)).status, 502);
 });
 
-test('stalled upstream request times out and serves stale data', async t => {
-  const { store, ctx } = setup(t);
+test('cached observations return before a stalled upstream finishes; timeout triggers a shared cooldown', async t => {
+  const { store, ctx, flush } = setup(t);
   store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: { 'X-Fetched-At': new Date(Date.now() - 3 * 3600000).toISOString() } }));
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let notifyStart!: () => void;
@@ -118,8 +133,16 @@ test('stalled upstream request times out and serves stale data', async t => {
   t.mock.method(globalThis, 'fetch', async (_url, options) => new Promise((_resolve, reject) => {
     options.signal.addEventListener('abort', () => reject(new Error('aborted'))); notifyStart();
   }));
-  const pending = fetchOmm(url, ctx); await started; t.mock.timers.tick(10001);
-  assert.equal((await pending).headers.get('X-Served-Stale'), '1');
+  // This must resolve without advancing the timer or resolving the fetch.
+  const immediate = await fetchOmm(url, ctx);
+  assert.equal(immediate.headers.get('X-Refresh-State'), 'revalidating');
+  await started;
+  assert.equal((await fetchOmm(url, ctx)).headers.get('X-Refresh-State'), 'revalidating');
+  t.mock.timers.tick(25001); await flush();
+  const retry = await fetchOmm(url, ctx);
+  assert.equal(retry.headers.get('X-Served-Stale'), '1');
+  assert.equal(retry.headers.get('X-Upstream-Error'), 'timeout');
+  assert.equal(retry.headers.get('X-Refresh-State'), 'failed');
 });
 
 test('unknown groups, legacy API, and non-GET methods do not reach upstream', async t => {

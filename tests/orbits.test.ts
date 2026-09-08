@@ -115,6 +115,48 @@ test('unmounted client requests abort rather than publishing synthetic fallback'
   await assert.rejects(loadGroup(GROUP_DEFS[7], ctrl.signal));
 });
 
+test('saved OMM appears before the network finishes and survives an upstream cooldown', async t => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  const fetched = new Date(Date.now() - 3600000).toISOString();
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: {
+    open: async () => ({ match: async () => new Response(JSON.stringify([issOmm]), {
+      headers: { 'X-Fetched-At': fetched },
+    }) }),
+  } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'caches', previous); else Reflect.deleteProperty(globalThis, 'caches'); });
+  let finish!: (r: Response) => void;
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; started(); return new Promise<Response>(resolve => { finish = resolve; }); });
+  let displayed: LoadedGroup | undefined;
+  const loading = loadGroup(GROUP_DEFS[7], undefined, group => { displayed = group; });
+  await ready;
+  assert.equal(displayed?.sats[0].kind, 'sgp4');
+  assert.match(deliveryStatus(displayed!), /refreshing in background/);
+  finish(new Response('unavailable', { status: 503, headers: { 'Retry-After': '900' } }));
+  const result = await loading;
+  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.equal(result.fetchedAt, Date.parse(fetched));
+  assert.equal(result.refreshState, 'failed');
+  assert.equal(calls, 1, 'must not ask the same unavailable provider for TLE too');
+});
+
+test('client tolerates denied browser storage and preserves background refresh state', async t => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: {
+    open: async () => { throw new Error('Storage disabled'); },
+  } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'caches', previous); else Reflect.deleteProperty(globalThis, 'caches'); });
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify([issOmm]), { headers: {
+    'X-Fetched-At': new Date(epoch).toISOString(), 'X-Served-Stale': '1', 'X-Refresh-State': 'revalidating',
+  } }));
+  const result = await loadGroup(GROUP_DEFS[7], undefined, () => assert.fail('no saved response'));
+  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.equal(result.fetchedAt, epoch);
+  assert.match(deliveryStatus(result), /refreshing in background/);
+});
+
 test('every group shares a timestamp, including reverse snapshots and failed positions', () => {
   const sats = GROUP_DEFS[7].fallback();
   const groups = new Map([['a', sats], ['b', sats]]);
