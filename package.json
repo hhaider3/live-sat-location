@@ -22,6 +22,11 @@
     "tailwind-merge": "3.4.0",
     "three": "^0.185.1"
   },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.4"
+    }
+  },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",

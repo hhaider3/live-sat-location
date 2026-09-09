@@ -171,10 +171,13 @@ test('empty-cache timeouts migrate to a one-minute retry without relaxing HTTP-d
   });
   assert.equal((await fetchOmm(activeUrl, ctx)).status, 503);
   assert.equal(calls, 0);
-  store.set(stateKey, new Response('', { headers: {
-    'X-Refresh-State': 'failed', 'X-Upstream-Error': 'timeout',
-    'X-Retry-At': String(attempted + 15 * 60000),
-  } }));
-  assert.equal((await fetchOmm(activeUrl, ctx)).status, 200);
-  assert.equal(calls, 1);
+  for (const reason of ['timeout', 'http-522', 'http-504']) {
+    store.delete(activeUrl.href);
+    store.set(stateKey, new Response('', { headers: {
+      'X-Refresh-State': 'failed', 'X-Upstream-Error': reason,
+      'X-Retry-At': String(attempted + 15 * 60000),
+    } }));
+    assert.equal((await fetchOmm(activeUrl, ctx)).status, 200);
+  }
+  assert.equal(calls, 3);
 });

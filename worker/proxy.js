@@ -24,6 +24,8 @@ function clientResponse(cached, stale = false) {
   return response;
 }
 
+const timedOut = reason => reason === 'timeout' || /^http-(408|504|522|524)$/.test(reason ?? '');
+
 // Cache API has no built-in stale-while-revalidate. Keep serving the validated
 // body while waitUntil refreshes it, and store retry state separately so neither
 // a failure nor a retry can change the original observation fetch timestamp.
@@ -51,7 +53,7 @@ async function serveCached(requestUrl, ctx, refresh) {
   let retryAt = Number(state?.headers.get('X-Retry-At') ?? 0);
   // Empty catalogs should recover from transient timeouts promptly. Older
   // deployments stored only the end of their fixed 15-minute retry window.
-  if (!usable && state?.headers.get('X-Upstream-Error') === 'timeout') {
+  if (!usable && timedOut(state?.headers.get('X-Upstream-Error'))) {
     const attemptedAt = Number(state.headers.get('X-Attempted-At')) || retryAt - 15 * 60000;
     retryAt = Math.min(retryAt, attemptedAt + 60000);
   }
@@ -75,7 +77,7 @@ async function serveCached(requestUrl, ctx, refresh) {
     const reason = response.headers.get('X-Upstream-Error');
     if (!response.ok || reason) {
       const seconds = reason === 'http-403' || reason === 'http-429' ? CACHE_TTL_SECONDS
-        : reason === 'timeout' && !usable ? 60 : 15 * 60;
+        : timedOut(reason) && !usable ? 60 : 15 * 60;
       await writeState('failed', seconds, reason ?? 'unavailable');
       response.headers.set('Retry-After', String(seconds));
       response.headers.set('X-Refresh-State', 'failed');
