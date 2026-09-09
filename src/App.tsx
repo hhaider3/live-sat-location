@@ -3,6 +3,7 @@ import { createEngine, DEFAULT_DISPLAY, type Engine, type SatSelection } from '.
 import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, type LoadedGroup, type Sat } from './satellites';
 import { formatSpeed } from './time';
 import PassPlanner from './PassPlanner';
+import { activeCatalog, loadInBatches } from './catalog';
 
 const PRESETS = [1, 60, 600, 3600, 86400];
 const PRESET_LABELS = ['1×', '60×', '10 min/s', '1 h/s', '1 d/s'];
@@ -56,10 +57,11 @@ export default function App() {
     let cancelled = false;
     let fetching = false;
     const lastAttempt = new Map<string, number>();
+    const sources = new Map<string, LoadedGroup>();
     const publish = (next: LoadedGroup) => {
       if (cancelled) return;
-      groupsRef.current = [...groupsRef.current.filter(g => g.key !== next.key), next]
-        .sort((a, b) => GROUP_DEFS.findIndex(g => g.key === a.key) - GROUP_DEFS.findIndex(g => g.key === b.key));
+      sources.set(next.key, next);
+      groupsRef.current = activeCatalog([...sources.values()], groupsRef.current);
       scene.setGroups(groupsRef.current);
       groupsRef.current.forEach(g => scene.setGroupVisible(g.key, visibilityRef.current.get(g.key) ?? true));
       setGroups([...groupsRef.current]);
@@ -67,32 +69,37 @@ export default function App() {
     const refresh = async (force = false) => {
       if (fetching || cancelled) return;
       const due = GROUP_DEFS.filter(def => {
-        const previous = groupsRef.current.find(g => g.key === def.key);
+        const previous = sources.get(def.key);
         if (force || !previous || previous.refreshState === 'revalidating') return true;
-        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= 5 * 60000 &&
+        const retryInterval = def.key === 'active' && !previous.sats.length ? 60000 : 5 * 60000;
+        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= retryInterval &&
           (previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
       });
       if (!due.length) return;
       fetching = true; setLoading(due.length);
-      await Promise.allSettled(due.map(async def => {
+      // Load the authoritative active pool first; classification feeds can
+      // complete afterwards without holding up the complete satellite display.
+      due.sort((a, b) => Number(b.key === 'active') - Number(a.key === 'active'));
+      await loadInBatches(due, async def => {
+        if (cancelled) return;
         lastAttempt.set(def.key, Date.now());
         try {
-          const hasObserved = groupsRef.current.some(g => g.key === def.key && g.sats.some(s => s.kind === 'sgp4'));
+          const hasObserved = sources.get(def.key)?.sats.some(s => s.kind === 'sgp4');
           let next = await loadGroup(def, controller.signal, hasObserved ? undefined : publish);
           if (cancelled) return;
-          const previous = groupsRef.current.find(g => g.key === def.key);
+          const previous = sources.get(def.key);
           // A transient failed refresh must not replace an observed catalog with invented objects.
           if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error };
           publish(next);
         } finally { if (!cancelled) setLoading(count => count - 1); }
-      }));
+      });
       fetching = false;
     };
     refreshRef.current = () => { void refresh(true); };
     void refresh();
     const interval = window.setInterval(() => { if (!document.hidden) void refresh(); }, 30000);
     const onVisible = () => {
-      if (!document.hidden && groupsRef.current.some(g => g.fetchedAt === null || Date.now() - g.fetchedAt >= 2 * 3600000)) void refresh();
+      if (!document.hidden) void refresh();
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
@@ -116,6 +123,9 @@ export default function App() {
   }, []);
 
   const allSats = useMemo(() => groups.flatMap(g => g.sats.map(sat => ({ group: g, sat }))), [groups]);
+  const sortedDefs = useMemo(() => [...GROUP_DEFS].sort((a, b) =>
+    (groups.find(g => g.key === b.key)?.sats.length ?? -1) - (groups.find(g => g.key === a.key)?.sats.length ?? -1)
+    || a.label.localeCompare(b.label)), [groups]);
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return [];
@@ -213,7 +223,9 @@ export default function App() {
       <button className="panel-toggle" aria-expanded={panelOpen} aria-controls="catalog-content" onClick={() => { setPanelOpen(o => !o); if (!panelOpen && window.innerWidth < 760) setDetailsOpen(false); }}><span>Constellations <small>{visibleCount.toLocaleString()} visible</small></span><span aria-hidden="true">{panelOpen ? '▾' : '▸'}</span></button>
       {panelOpen && <div id="catalog-content" className="catalog-content">
         <div className="quick-actions"><button className="action small" onClick={() => isolate()}>Show all</button><button className="action small" disabled={loading > 0} onClick={() => refreshRef.current()}>{loading ? 'Loading…' : 'Refresh data'}</button></div>
-        <ul className="group-list">{GROUP_DEFS.map(def => {
+        <p className="muted">Active satellites · largest groups first</p>
+        {!loading && groups.length > 0 && !allSats.length && <p className="notice" role="status">The active satellite catalog is unavailable. Automatic retries are scheduled; no inactive or simulated objects are substituted.</p>}
+        <ul className="group-list">{sortedDefs.map(def => {
           const g = groups.find(g => g.key === def.key);
           return <li key={def.key}>
             <div className="group-row"><button className={`group-toggle ${isVisible(def.key) ? '' : 'dimmed'}`} aria-label={`${def.label} visibility`} aria-pressed={isVisible(def.key)} onClick={() => setVisible(def.key, !isVisible(def.key))}><span className="dot" style={{ background: def.color }} /><span>{def.label}</span><span className="group-count">{g?.sats.length.toLocaleString() ?? '…'}</span></button><button className="isolate-button" title={`Show only ${def.label}`} aria-label={`Isolate ${def.label}`} onClick={() => isolate(def.key)}>◎</button></div>

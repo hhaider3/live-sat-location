@@ -300,7 +300,8 @@ export function createEngine(
       changed = true;
     }
     if (previous && !groupRenders.includes(selected!.g)) {
-      const g = groupRenders.find(g => g.key === previous.key);
+      const g = groupRenders.find(g => g.key === previous.key && g.sats.some(s => s.id === previous.id))
+        ?? groupRenders.find(g => g.sats.some(s => s.id === previous.id));
       const i = g?.sats.findIndex(s => s.id === previous.id) ?? -1;
       selectTarget(g && i >= 0 ? { g, i } : null);
       following = !!selected && previous.following;

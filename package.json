@@ -23,9 +23,7 @@
     "three": "^0.185.1"
   },
   "overrides": {
-    "miniflare": {
-      "sharp": "0.35.4"
-    }
+    "sharp": "0.35.4"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",

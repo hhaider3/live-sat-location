@@ -238,6 +238,7 @@ export const GROUP_DEFS: GroupDef[] = [
   { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), legacyUrl: LEGACY_CT("geo"), fallback: fallbackGeo },
   { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), legacyUrl: LEGACY_CT("science"), fallback: fallbackOther },
   { key: "kuiper", label: "Amazon Leo (Kuiper)", color: "#f59e0b", url: CT("kuiper"), legacyUrl: LEGACY_CT("kuiper"), fallback: () => [] },
+  { key: "active", label: "Other active satellites", color: "#94a3b8", url: CT("active"), legacyUrl: '', fallback: () => [] },
 ];
 
 // ---------- Validated OMM data and freshness ----------
@@ -324,7 +325,7 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal,
   const abort = () => ctrl.abort();
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) ctrl.abort();
-  let timer = setTimeout(abort, 15000);
+  let timer = setTimeout(abort, def.key === 'active' ? 35000 : 15000);
   try {
     let firstError: unknown;
     try {
@@ -352,7 +353,7 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal,
     // Each request gets its own timeout. An OMM timeout must not abort the
     // compatibility request before it starts. Caller cancellation still wins.
     clearTimeout(timer);
-    if (signal?.aborted) throw firstError;
+    if (signal?.aborted || !def.legacyUrl) throw firstError;
     const legacyController = new AbortController();
     const abortLegacy = () => legacyController.abort();
     signal?.addEventListener('abort', abortLegacy, { once: true });
