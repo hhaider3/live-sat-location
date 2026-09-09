@@ -155,3 +155,26 @@ test('unknown groups, legacy API, and non-GET methods do not reach upstream', as
   assert.equal((await worker.fetch(new Request('https://orbit.test/api/tle'), env, ctx)).status, 400);
   assert.equal(await (await worker.fetch(new Request('https://orbit.test/'), env, ctx)).text(), 'app');
 });
+
+test('empty-cache timeouts migrate to a one-minute retry without relaxing HTTP-denial cooldowns', async t => {
+  const { store, ctx } = setup(t);
+  const activeUrl = new URL('https://orbit.test/api/omm?group=active');
+  const stateKey = `${activeUrl}&refresh-state=1`;
+  const attempted = Date.now() - 2 * 60000;
+  store.set(stateKey, new Response('', { headers: {
+    'X-Refresh-State': 'failed', 'X-Upstream-Error': 'http-403',
+    'X-Retry-At': String(attempted + 2 * 3600000),
+  } }));
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++; return new Response(JSON.stringify([issOmm]));
+  });
+  assert.equal((await fetchOmm(activeUrl, ctx)).status, 503);
+  assert.equal(calls, 0);
+  store.set(stateKey, new Response('', { headers: {
+    'X-Refresh-State': 'failed', 'X-Upstream-Error': 'timeout',
+    'X-Retry-At': String(attempted + 15 * 60000),
+  } }));
+  assert.equal((await fetchOmm(activeUrl, ctx)).status, 200);
+  assert.equal(calls, 1);
+});

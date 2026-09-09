@@ -48,13 +48,20 @@ async function serveCached(requestUrl, ctx, refresh) {
   const retentionAge = Number.isFinite(age) ? age
     : now - Date.parse(cached?.headers.get('Last-Modified') ?? '');
   const usable = cached && retentionAge >= 0 && retentionAge < STALE_TTL_SECONDS * 1000;
-  const retryAt = Number(state?.headers.get('X-Retry-At') ?? 0);
+  let retryAt = Number(state?.headers.get('X-Retry-At') ?? 0);
+  // Empty catalogs should recover from transient timeouts promptly. Older
+  // deployments stored only the end of their fixed 15-minute retry window.
+  if (!usable && state?.headers.get('X-Upstream-Error') === 'timeout') {
+    const attemptedAt = Number(state.headers.get('X-Attempted-At')) || retryAt - 15 * 60000;
+    retryAt = Math.min(retryAt, attemptedAt + 60000);
+  }
   const waiting = retryAt > now;
   const status = waiting ? state.headers.get('X-Refresh-State') : 'revalidating';
   const writeState = async (status, seconds, reason = '') => {
     const response = new Response('', { headers: {
       'Cache-Control': `public, max-age=${seconds}`,
       'X-Refresh-State': status, 'X-Retry-At': String(Date.now() + seconds * 1000),
+      'X-Attempted-At': String(Date.now()),
       'X-Upstream-Error': reason,
     } });
     await cache.put(stateKey, response).catch(() => {});
@@ -67,7 +74,8 @@ async function serveCached(requestUrl, ctx, refresh) {
     await Promise.allSettled(writes);
     const reason = response.headers.get('X-Upstream-Error');
     if (!response.ok || reason) {
-      const seconds = reason === 'http-403' || reason === 'http-429' ? CACHE_TTL_SECONDS : 15 * 60;
+      const seconds = reason === 'http-403' || reason === 'http-429' ? CACHE_TTL_SECONDS
+        : reason === 'timeout' && !usable ? 60 : 15 * 60;
       await writeState('failed', seconds, reason ?? 'unavailable');
       response.headers.set('Retry-After', String(seconds));
       response.headers.set('X-Refresh-State', 'failed');
@@ -120,7 +128,7 @@ async function refreshOmm(requestUrl, ctx) {
   upstreamUrl.searchParams.set('GROUP', group);
   upstreamUrl.searchParams.set('FORMAT', 'JSON');
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cached ? 25000 : 10000);
+  const timer = setTimeout(() => controller.abort(), cached || group === 'active' ? 25000 : 10000);
   try {
     const upstream = await fetch(upstreamUrl, { signal: controller.signal, headers: {
       Accept: 'application/json',
