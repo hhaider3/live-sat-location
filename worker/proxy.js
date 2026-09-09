@@ -4,7 +4,7 @@ export const CACHE_TTL_SECONDS = 2 * 60 * 60;
 export const STALE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const ALLOWED_GROUPS = new Set([
   'starlink', 'oneweb', 'gps-ops', 'glo-ops', 'galileo', 'beidou',
-  'iridium-NEXT', 'stations', 'geo', 'science', 'kuiper',
+  'iridium-NEXT', 'stations', 'geo', 'science', 'kuiper', 'active',
 ]);
 
 export function errorResponse(message, status, extraHeaders = {}) {
