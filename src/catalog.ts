@@ -3,10 +3,14 @@ import { GROUP_DEFS, type LoadedGroup, type Sat } from './satellites';
 // Explicit catalog naming conventions keep these constellations classified
 // even while their membership endpoint is unavailable. AMAZONAS is unrelated.
 const constellationNames: Record<string, RegExp> = {
-  starlink: /^STARLINK-\d+$/i,
+  starlink: /^STARLINK-\d+(?: \[DTC\])?$/i,
   oneweb: /^ONEWEB-\d+$/i,
   kuiper: /^KUIPER-\d+$/i,
 };
+
+// These large feeds duplicate active records and their explicit names already
+// identify membership. Only request the smaller, non-name-based memberships.
+export const CATALOG_REQUESTS = GROUP_DEFS.filter(def => !(def.key in constellationNames));
 
 /** Active feed owns the objects and epochs; named feeds supply membership only.
  * Stable definition order resolves overlapping memberships before count sorting.

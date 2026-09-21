@@ -8,7 +8,8 @@
     "dev:worker": "npm run build && wrangler dev",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "npm run build && wrangler deploy",
+    "snapshot:update": "node scripts/update-snapshot.mjs",
+    "deploy": "node scripts/update-snapshot.mjs --allow-existing && npm run build && wrangler deploy",
     "test": "node scripts/test.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build"

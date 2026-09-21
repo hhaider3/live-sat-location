@@ -1,4 +1,6 @@
 import { normalizeOmm } from '../shared/omm.ts';
+import { parseOmmCsv } from '../shared/csv.ts';
+import { assetSnapshot, fetchMirrorSnapshot, snapshotResponse } from './snapshot.js';
 
 export const CACHE_TTL_SECONDS = 2 * 60 * 60;
 export const STALE_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -29,7 +31,7 @@ const timedOut = reason => reason === 'timeout' || /^http-(408|504|522|524)$/.te
 // Cache API has no built-in stale-while-revalidate. Keep serving the validated
 // body while waitUntil refreshes it, and store retry state separately so neither
 // a failure nor a retry can change the original observation fetch timestamp.
-async function serveCached(requestUrl, ctx, refresh) {
+async function serveCached(requestUrl, ctx, refresh, env) {
   const group = requestUrl.searchParams.get('group');
   if (!group || !ALLOWED_GROUPS.has(group)) return errorResponse('Unknown satellite group', 400);
   const canonical = new URL(requestUrl.pathname, requestUrl.origin);
@@ -39,8 +41,16 @@ async function serveCached(requestUrl, ctx, refresh) {
   stateUrl.searchParams.set('refresh-state', '1');
   const stateKey = new Request(stateUrl);
   const cache = getCache();
-  if (!cache) return refresh(requestUrl, ctx);
-  const [cached, state] = await Promise.all([
+  const canSeed = group === 'active' && requestUrl.pathname === '/api/omm' && env?.ASSETS;
+  if (!cache) {
+    const seed = canSeed ? await assetSnapshot(requestUrl, env) : null;
+    if (!seed) return refresh(requestUrl, ctx);
+    ctx.waitUntil(refresh(requestUrl, ctx).then(response => { void response.body?.cancel().catch(() => {}); }));
+    const response = clientResponse(seed, true);
+    response.headers.set('X-Refresh-State', 'revalidating');
+    return response;
+  }
+  let [cached, state] = await Promise.all([
     cache.match(key).catch(() => null), cache.match(stateKey).catch(() => null),
   ]);
   const now = Date.now();
@@ -49,7 +59,17 @@ async function serveCached(requestUrl, ctx, refresh) {
   if (cached && age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
   const retentionAge = Number.isFinite(age) ? age
     : now - Date.parse(cached?.headers.get('Last-Modified') ?? '');
-  const usable = cached && retentionAge >= 0 && retentionAge < STALE_TTL_SECONDS * 1000;
+  let usable = cached && retentionAge >= 0 && retentionAge < STALE_TTL_SECONDS * 1000;
+  // Cloudflare's edge cache can be empty in any region. A deployed asset is
+  // shared by every visitor and lets the cold request return before upstream.
+  if (!usable && canSeed) {
+    const seed = await assetSnapshot(requestUrl, env);
+    if (seed) {
+      cached = seed;
+      usable = true;
+      await cache.put(key, seed.clone()).catch(() => {});
+    }
+  }
   let retryAt = Number(state?.headers.get('X-Retry-At') ?? 0);
   // Empty catalogs should recover from transient timeouts promptly. Older
   // deployments stored only the end of their fixed 15-minute retry window.
@@ -105,7 +125,7 @@ async function serveCached(requestUrl, ctx, refresh) {
   return run();
 }
 
-export const fetchOmm = (url, ctx) => serveCached(url, ctx, refreshOmm);
+export const fetchOmm = (url, ctx, env) => serveCached(url, ctx, refreshOmm, env);
 export const fetchTle = (url, ctx) => serveCached(url, ctx, refreshTle);
 
 async function refreshOmm(requestUrl, ctx) {
@@ -119,7 +139,20 @@ async function refreshOmm(requestUrl, ctx) {
   const cached = cache ? await cache.match(key).catch(() => null) : null;
   const age = cached ? Date.now() - Date.parse(cached.headers.get('X-Fetched-At') ?? '') : Infinity;
   if (cached && age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
-  const fallback = (reason) => {
+  const fallback = async (reason) => {
+    if (group === 'active') {
+      try {
+        const snapshot = await fetchMirrorSnapshot(AbortSignal.timeout(8000));
+        const previousFetch = Date.parse(cached?.headers.get('X-Fetched-At') ?? '');
+        if (!Number.isFinite(previousFetch) || Date.parse(snapshot.fetchedAt) > previousFetch) {
+          const saved = snapshotResponse(snapshot);
+          if (cache) ctx.waitUntil(cache.put(key, saved.clone()).catch(() => {}));
+          const response = clientResponse(saved, true);
+          response.headers.set('X-Upstream-Error', reason);
+          return response;
+        }
+      } catch { /* keep the last validated observations */ }
+    }
     const response = cached && age >= 0 && age < STALE_TTL_SECONDS * 1000
       ? clientResponse(cached, true) : errorResponse('Orbital data source is unavailable', 502);
     response.headers.set('X-Upstream-Error', reason);
@@ -128,19 +161,21 @@ async function refreshOmm(requestUrl, ctx) {
 
   const upstreamUrl = new URL('https://celestrak.org/NORAD/elements/gp.php');
   upstreamUrl.searchParams.set('GROUP', group);
-  upstreamUrl.searchParams.set('FORMAT', 'JSON');
+  upstreamUrl.searchParams.set('FORMAT', 'CSV');
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cached || group === 'active' ? 25000 : 10000);
+  // Leave room for the independent mirror inside waitUntil's 30-second budget.
+  const timer = setTimeout(() => controller.abort(), group === 'active' ? 15000 : cached ? 25000 : 10000);
   try {
     const upstream = await fetch(upstreamUrl, { signal: controller.signal, headers: {
-      Accept: 'application/json',
+      Accept: 'text/csv',
       'User-Agent': 'live-sat-location/2.0 (+https://github.com/hhaider3/live-sat-location)',
     } });
     if (!upstream.ok) return fallback(`http-${upstream.status}`);
-    const data = await upstream.json();
-    if (!Array.isArray(data)) return fallback('invalid-data');
+    const data = parseOmmCsv(await upstream.text());
     const records = data.map(normalizeOmm).filter(Boolean);
     if (!records.length) return fallback('invalid-data');
+    if (group === 'active' && (records.length < 10000 ||
+        (cached && records.length < (await cached.clone().json()).length * 0.8))) return fallback('invalid-data');
     const response = new Response(JSON.stringify(records), { headers: {
       'Cache-Control': `public, max-age=${STALE_TTL_SECONDS}`,
       'Content-Type': 'application/json; charset=utf-8',

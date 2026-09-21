@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import worker from '../worker/index.js';
 import { fetchOmm, fetchTle, STALE_TTL_SECONDS } from '../worker/proxy.js';
-import { issOmm, tle } from './fixtures';
+import { issOmm, tle, ommCsv } from './fixtures';
+import { fetchMirrorSnapshot } from '../worker/snapshot.js';
+import { ACTIVE_SOURCE, MIRROR_STATUS, MIRROR_SOURCE, SNAPSHOT_PATH } from '../shared/snapshot';
 
 function setup(t: Parameters<Parameters<typeof test>[1]>[0]) {
   const store = new Map<string, Response>();
@@ -18,12 +21,12 @@ function setup(t: Parameters<Parameters<typeof test>[1]>[0]) {
 }
 const url = new URL('https://orbit.test/api/omm?group=stations');
 
-test('JSON upstream query supports new catalog IDs, caches valid records and canonicalizes keys', async t => {
+test('compact CSV upstream preserves new catalog IDs and serves the compatible JSON API', async t => {
   const { store, ctx, flush } = setup(t);
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async (input: URL) => {
-    calls++; assert.equal(input.searchParams.get('FORMAT'), 'JSON');
-    return new Response(JSON.stringify([{ ...issOmm, NORAD_CAT_ID: 100608 }, { invalid: true }]));
+    calls++; assert.equal(input.searchParams.get('FORMAT'), 'CSV');
+    return new Response(ommCsv([{ ...issOmm, NORAD_CAT_ID: 100608 }, { invalid: true }]));
   });
   const first = await fetchOmm(new URL(`${url}&extra=ignored`), ctx);
   assert.equal(first.status, 200); assert.equal(first.headers.get('X-Rejected-Records'), '1');
@@ -167,7 +170,7 @@ test('empty-cache timeouts migrate to a one-minute retry without relaxing HTTP-d
   } }));
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
-    calls++; return new Response(JSON.stringify([issOmm]));
+    calls++; return new Response(ommCsv(Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }))));
   });
   assert.equal((await fetchOmm(activeUrl, ctx)).status, 503);
   assert.equal(calls, 0);
@@ -180,4 +183,63 @@ test('empty-cache timeouts migrate to a one-minute retry without relaxing HTTP-d
     assert.equal((await fetchOmm(activeUrl, ctx)).status, 200);
   }
   assert.equal(calls, 3);
+});
+
+test('a first visit in a cold region gets the deployed catalog even during an upstream cooldown', async t => {
+  const { store, ctx } = setup(t);
+  const activeUrl = new URL('https://orbit.test/api/omm?group=active');
+  const fetchedAt = new Date(Date.now() - 3 * 3600000).toISOString();
+  store.set(`${activeUrl}&refresh-state=1`, new Response('', { headers: {
+    'X-Refresh-State': 'failed', 'X-Upstream-Error': 'http-403', 'X-Retry-At': String(Date.now() + 3600000),
+  } }));
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('must respect cooldown'); });
+  const env = { ASSETS: { fetch: async (request: Request) => {
+    assert.equal(new URL(request.url).pathname, SNAPSHOT_PATH);
+    return Response.json({ version: 1, source: ACTIVE_SOURCE, fetchedAt, records: [issOmm] });
+  } } };
+  const response = await worker.fetch(new Request(activeUrl), env, ctx);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('X-Catalog-Snapshot'), '1');
+  assert.equal(response.headers.get('X-Fetched-At'), fetchedAt);
+  assert.equal(response.headers.get('X-Upstream-Error'), 'http-403');
+  assert.deepEqual(await response.json(), [issOmm]);
+  assert.ok(store.has(activeUrl.href));
+});
+
+test('cold startup returns before upstream timeout and a verified mirror refresh survives for the next visitor', async t => {
+  const { store, ctx, flush } = setup(t);
+  const activeUrl = new URL('https://orbit.test/api/omm?group=active');
+  const old = new Date(Date.now() - 3 * 3600000).toISOString();
+  const newer = new Date(Date.now() - 60000).toISOString();
+  const records = Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
+  const body = JSON.stringify(records);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let start!: () => void;
+  const started = new Promise<void>(resolve => { start = resolve; });
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === MIRROR_STATUS) return Response.json({ dataset: 'active', query: 'GROUP', value: 'active',
+      last_success: newer, record_count: records.length, sha256: createHash('sha256').update(body).digest('hex') });
+    if (String(url) === MIRROR_SOURCE) return new Response(body);
+    return new Promise<Response>((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new Error('timeout'))); start();
+    });
+  });
+  const env = { ASSETS: { fetch: async () => Response.json({ version: 1, source: ACTIVE_SOURCE, fetchedAt: old, records: [issOmm] }) } };
+  const first = await worker.fetch(new Request(activeUrl), env, ctx);
+  assert.equal(first.headers.get('X-Fetched-At'), old);
+  assert.equal(first.headers.get('X-Refresh-State'), 'revalidating');
+  await started; t.mock.timers.tick(15001); await flush();
+  const second = await fetchOmm(activeUrl, ctx, env);
+  assert.equal(second.headers.get('X-Fetched-At'), newer);
+  assert.equal(second.headers.get('X-Data-Source'), MIRROR_SOURCE);
+  assert.equal((await second.json()).length, 10000);
+  assert.equal(store.get(activeUrl.href)!.headers.get('X-Fetched-At'), newer);
+});
+
+test('a mirror publication mismatch is rejected without accepting a new fetch timestamp', async t => {
+  t.mock.method(globalThis, 'fetch', async url => String(url) === MIRROR_STATUS
+    ? Response.json({ dataset: 'active', query: 'GROUP', value: 'active', record_count: 10000,
+      last_success: new Date().toISOString(), sha256: '0'.repeat(64) })
+    : Response.json([issOmm]));
+  await assert.rejects(fetchMirrorSnapshot(AbortSignal.timeout(1000)), /digest mismatch/);
 });

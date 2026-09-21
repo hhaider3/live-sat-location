@@ -6,7 +6,7 @@ An interactive 3D satellite explorer built with React, Three.js, and satellite.j
 
 **Live demo:** [live-sat-location.hasanhaider009.workers.dev](https://live-sat-location.hasanhaider009.workers.dev/)
 
-Rendering and orbit propagation run in the browser. A small Cloudflare Worker serves and caches CelesTrak's OMM-compatible JSON feed; without that API, the app uses explicitly labeled simulated constellations.
+Rendering and orbit propagation run in the browser. A small Cloudflare Worker downloads CelesTrak's compact OMM-compatible CSV and serves a validated JSON API. A site-hosted catalog snapshot lets first-time visitors see observed satellites even when the live API is unavailable.
 
 ## Features
 
@@ -37,7 +37,7 @@ Rendering and orbit propagation run in the browser. A small Cloudflare Worker se
 | Enter | Select a result (or the first match from the search input) |
 | `Esc` | Clear search when searching; otherwise deselect |
 | Space | Pause/play when outside an interactive control |
-| Find ISS | Select the real ISS if available, or the labeled simulated ISS |
+| Find ISS | Select the real ISS from the loaded active catalog |
 | Follow satellite | Move the camera along with the selected satellite |
 | Reset view | Stop following and return to the initial Earth view |
 | Constellation / ◎ | Toggle visibility / isolate that group |
@@ -64,30 +64,35 @@ npm run dev
 
 Open the URL printed by Vite, usually [localhost:5173](http://localhost:5173).
 
-Without the Worker, the frontend falls back to simulated objects. `npm run preview` previews static assets only; use `npm run dev:worker` and open port 8787 to test the production build with its API. Editing app source requires rebuilding when viewing the Worker's static assets.
+Without the Worker, the frontend loads the saved observed catalog in `public/data/active.json` and labels its original fetch date. `npm run preview` previews static assets only; use `npm run dev:worker` and open port 8787 to test the production build with its API. Editing app source requires rebuilding when viewing the Worker's static assets.
 
 ```bash
 npm run check       # TypeScript, focused tests, production build
 npm audit           # dependency advisories
 npm run build       # produces dist/index.html
-npm run deploy      # build and deploy Worker + assets to Cloudflare
+npm run snapshot:update # refresh the site-hosted startup catalog
+npm run deploy      # refresh snapshot, build and deploy Worker + assets
 ```
 
-For repeatable UI checks without CelesTrak, run `node scripts/preview-fixtures.mjs` in place of the Worker, then start Vite. This local-only API serves explicitly named test objects, a delayed 12,000-object group, a stale group, and one unavailable group. It is never bundled into the app.
+For repeatable UI checks without CelesTrak, run `node scripts/preview-fixtures.mjs` in place of the Worker, then start Vite. This local-only API serves explicitly named test objects and unavailable groups. It is never bundled into the app. To check first-visit fallback, open the static preview on an unused port: it has no working API and must still display the saved catalog.
 
 The GitHub Actions workflow runs the checks and dependency audit on pushes and pull requests. Tests use fixed orbital fixtures and mocked upstream/cache responses, so they do not depend on a live data source.
 
 ## Data and freshness
 
-Starlink, OneWeb, and Amazon Leo also use their explicit numbered satellite-name prefixes for classification when a group feed is unavailable. Other objects stay in Other active satellites until their membership is known.
+Starlink, OneWeb, and Amazon Leo use their explicit numbered satellite-name prefixes for classification. Their large membership feeds are not downloaded again because the active feed already contains those records. Other objects stay in Other active satellites until their membership is known.
 
 The visualization includes all usable records in CelesTrak's **Active Satellites** OMM feed (`GROUP=active`). Named feeds supply constellation membership; objects missing from those feeds appear in **Other active satellites**. Every catalog ID is drawn and counted once. Stable group priority resolves overlapping memberships, then the sidebar is sorted by actual count, largest first. All displayed orbital elements and freshness metadata come from the active feed. Membership feeds cannot add inactive objects, debris, or synthetic objects. If the active feed is unavailable, a saved active feed is used when available; otherwise the catalog is explicitly unavailable.
 
-The active feed is requested first and at most three group requests run concurrently. Satellites appear as soon as the active feed arrives; later membership results classify them without holding up the complete catalog. Counts can move between groups while membership loads. Selection follows the satellite's catalog ID when its group changes. The full active feed allows 25 seconds upstream and 35 seconds in the client and never falls back to TLE, which cannot represent all newer catalog IDs. Empty-cache timeouts retry after one minute; existing cached catalogs retain the 15-minute timeout backoff. HTTP 403/429 cooldowns remain two hours.
+The active feed is requested first and at most three API requests run concurrently. The browser also starts an independent download of the site-hosted startup snapshot, without waiting for browser storage or the API. The newest validated catalog wins; an older response cannot roll back a newer snapshot. Satellite counts and search become available while the smaller membership feeds finish. Selection follows the satellite's catalog ID when its group changes. The active upstream request allows 15 seconds plus up to 8 seconds for a backup mirror, within the 35-second client timeout. It never falls back to TLE, which cannot represent all newer catalog IDs. Empty-cache timeouts retry after one minute; existing cached catalogs retain the 15-minute timeout backoff. HTTP 403/429 cooldowns remain two hours.
 
-Amazon Leo is displayed as **Amazon Leo (Kuiper)** and uses CelesTrak's `kuiper` OMM group. Searching either name finds its satellites. If no observed data is available, this group is marked Unavailable with zero objects; no synthetic Amazon fleet is generated.
+Amazon Leo is displayed as **Amazon Leo (Kuiper)** and uses the `KUIPER-` names in the active feed. Searching either name finds its satellites. If no observed data is available, this group is marked Unavailable with zero objects; no synthetic Amazon fleet is generated.
 
-`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=JSON`, validates records, and caches a good response for two hours. Older cached observations are returned immediately while `ctx.waitUntil` refreshes them in the background. Retention is bounded at 30 days, subject to Cloudflare cache eviction; this is best-effort storage. Invalid responses never replace a good cached copy. Cold upstream requests time out after 10 seconds; background refreshes get 25 seconds without delaying the response. `/api/tle` remains a compatibility fallback, but the client respects `Retry-After` instead of making a second request to an unavailable provider.
+`GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=CSV`, validates and converts records, and caches a JSON response for two hours. CSV carries the same OMM fields and extended IDs with much less transfer overhead than JSON. Quoted fields, column order and CRLF are supported; malformed or truncated rows are rejected. Older cached observations are returned immediately while `ctx.waitUntil` refreshes them in the background. Retention is bounded at 30 days, subject to Cloudflare cache eviction; this is best-effort storage. Invalid responses never replace a good cached copy. Small cold upstream requests time out after 10 seconds; their background refreshes get 25 seconds without delaying the response. `/api/tle` remains a compatibility fallback for smaller groups, but the client respects `Retry-After` instead of making a second request to an unavailable provider.
+
+An empty edge cache is seeded from the deployed `public/data/active.json` asset, including during an upstream cooldown. If CelesTrak cannot refresh the active feed, the Worker tries the [Orbit Data mirror](https://github.com/Darkflib/orbit-data), checks its published SHA-256 digest and record count, validates every record, and preserves its original `last_success` timestamp. The mirror and snapshot are independently rejected after 30 days. Successful live refreshes replace saved data; failures cannot erase it. `X-Catalog-Snapshot` and `X-Data-Source` identify this provenance, and the interface labels the saved date separately from element freshness.
+
+`npm run snapshot:update` refreshes the checked-in startup asset from CelesTrak or the verified mirror using an atomic replacement. It rejects incomplete catalogs, duplicate IDs, and unexpected count drops. Deployment runs this step automatically and can retain an existing valid snapshot if both providers fail; normal builds and tests do not use the network. The startup snapshot must be refreshed/redeployed before its 30-day retention expires. Ongoing Worker refreshes use the mirror as a second live source; the packaged asset itself is unchanged until redeployment.
 
 Refresh state is cached separately: timeouts and server errors back off for 15 minutes, and HTTP 403/429 responses for two hours. `X-Refresh-State` distinguishes an ongoing background refresh from a failed one. The original `X-Fetched-At` never changes on failure. The browser also retains validated OMM responses for up to 30 days and renders them before a new request finishes; storage is optional and synthetic data is never saved.
 
@@ -130,8 +135,13 @@ src/
   passes.worker.ts        Background pass calculation
   time.ts                 Anchored simulation clock
 shared/omm.ts             Shared orbital record validation
+shared/csv.ts             Compact OMM CSV parsing
+shared/snapshot.ts        Startup snapshot validation and provenance
 worker/index.js           Cloudflare request routing
 worker/proxy.js           Cached CelesTrak JSON proxy
+worker/snapshot.js        Deployed catalog and verified mirror recovery
+public/data/active.json   Observed startup catalog with original fetch date
+scripts/update-snapshot.mjs Atomic startup catalog update
 scripts/test.mjs          Isolated test build and runner
 tests/                   Orbital, playback, and proxy regression tests
 ```

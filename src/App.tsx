@@ -3,7 +3,7 @@ import { createEngine, DEFAULT_DISPLAY, type Engine, type SatSelection } from '.
 import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, type LoadedGroup, type Sat } from './satellites';
 import { formatSpeed } from './time';
 import PassPlanner from './PassPlanner';
-import { activeCatalog, loadInBatches } from './catalog';
+import { activeCatalog, CATALOG_REQUESTS, loadInBatches } from './catalog';
 
 const PRESETS = [1, 60, 600, 3600, 86400];
 const PRESET_LABELS = ['1×', '60×', '10 min/s', '1 h/s', '1 d/s'];
@@ -29,7 +29,7 @@ export default function App() {
   const resultButtons = useRef<(HTMLButtonElement | null)[]>([]);
   const [groups, setGroups] = useState<LoadedGroup[]>([]);
   const [visibility, setVisibility] = useState<Record<string, boolean>>({});
-  const [loading, setLoading] = useState(GROUP_DEFS.length);
+  const [loading, setLoading] = useState(CATALOG_REQUESTS.length);
   const [simTime, setSimTime] = useState(Date.now());
   const [fps, setFps] = useState(60);
   const [selection, setSelection] = useState<SatSelection | null>(null);
@@ -68,12 +68,12 @@ export default function App() {
     };
     const refresh = async (force = false) => {
       if (fetching || cancelled) return;
-      const due = GROUP_DEFS.filter(def => {
+      const due = CATALOG_REQUESTS.filter(def => {
         const previous = sources.get(def.key);
         if (force || !previous || previous.refreshState === 'revalidating') return true;
         const retryInterval = def.key === 'active' && !previous.sats.length ? 60000 : 5 * 60000;
         return Date.now() - (lastAttempt.get(def.key) ?? 0) >= retryInterval &&
-          (previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
+          (previous.servedStale || previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
       });
       if (!due.length) return;
       fetching = true; setLoading(due.length);
@@ -90,6 +90,9 @@ export default function App() {
           const previous = sources.get(def.key);
           // A transient failed refresh must not replace an observed catalog with invented objects.
           if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error };
+          if (previous?.sats.length && (previous.fetchedAt ?? -Infinity) > (next.fetchedAt ?? -Infinity)) {
+            next = { ...previous, servedStale: true, refreshState: next.refreshState ?? 'failed' };
+          }
           publish(next);
         } finally { if (!cancelled) setLoading(count => count - 1); }
       });
@@ -173,7 +176,8 @@ export default function App() {
       <section className="panel overview" aria-label="Satellite explorer">
         <div className="brand-row"><h1><span aria-hidden="true">◉</span> Earth Orbit</h1><span className={`badge ${isLiveTime ? 'fresh' : 'playback'}`}>{isLiveTime ? 'Live time' : paused ? 'Paused' : 'Playback'}</span></div>
         <p className="intro">Explore the objects moving around our planet.</p>
-        <div className="catalog-summary" aria-live="polite">{loading > 0 ? `Loading ${loading} groups…` : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
+        <div className="catalog-summary" aria-live="polite">{!allSats.length && loading > 0 ? 'Loading satellite catalog…' : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
+        {allSats.length > 0 && groups.some(g => g.catalogSnapshot) && <p className="muted" role="status">Showing a saved catalog from {utc(groups.find(g => g.catalogSnapshot)!.fetchedAt!)}. {loading ? 'Checking for updates…' : 'Live updates will resume when available.'}</p>}
         <div className="search-wrap"><label className="sr-only" htmlFor="satellite-search">Search satellites by name or catalog ID</label>
           <input id="satellite-search" ref={search} type="search" autoComplete="off" placeholder="Search name or catalog ID…" value={query}
             aria-controls={query.trim() ? 'search-results' : undefined}
@@ -224,7 +228,7 @@ export default function App() {
       {panelOpen && <div id="catalog-content" className="catalog-content">
         <div className="quick-actions"><button className="action small" onClick={() => isolate()}>Show all</button><button className="action small" disabled={loading > 0} onClick={() => refreshRef.current()}>{loading ? 'Loading…' : 'Refresh data'}</button></div>
         <p className="muted">Active satellites · largest groups first</p>
-        {!loading && groups.length > 0 && !allSats.length && <p className="notice" role="status">The active satellite catalog is unavailable. Automatic retries are scheduled; no inactive or simulated objects are substituted.</p>}
+        {groups.length > 0 && !allSats.length && <p className="notice" role="status">The active satellite catalog is unavailable. Automatic retries are scheduled; no inactive or simulated objects are substituted.</p>}
         <ul className="group-list">{sortedDefs.map(def => {
           const g = groups.find(g => g.key === def.key);
           return <li key={def.key}>

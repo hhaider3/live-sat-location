@@ -1,5 +1,6 @@
 import * as satlib from "satellite.js";
 import { epochMillis, normalizeOmm } from "../shared/omm";
+import { readSnapshot, SNAPSHOT_PATH } from '../shared/snapshot';
 
 // ---------- Types ----------
 
@@ -30,6 +31,7 @@ export interface LoadedGroup extends GroupDef {
   fetchedAt: number | null;
   servedStale: boolean;
   refreshState?: string;
+  catalogSnapshot?: boolean;
   rejectedCount: number;
   error?: string;
 }
@@ -260,6 +262,8 @@ export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): 
 
 export function deliveryStatus(group: LoadedGroup, now = Date.now()): string {
   if (!group.sats.some(s => s.kind === 'sgp4')) return group.error ?? 'Observed data unavailable';
+  if (group.catalogSnapshot) return group.refreshState === 'revalidating'
+    ? 'Saved catalog; checking for updates' : 'Using saved catalog; live refresh pending';
   if (group.refreshState === 'revalidating') return 'Cached observations; refreshing in background';
   if (group.servedStale) return 'Refresh failed; using cached observations';
   if (group.fetchedAt === null) return 'Observed data; fetch time unknown';
@@ -296,15 +300,64 @@ const LOCAL_CACHE = 'orbit-observations-v1';
 // Persist only observed OMM responses. Storage denial/eviction is harmless;
 // neither synthetic fallback nor a failed request can overwrite this copy.
 async function savedResponse(def: GroupDef): Promise<Response | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const cache = await caches.open(LOCAL_CACHE);
-    const response = await cache.match(def.url);
-    const age = Date.now() - Date.parse(response?.headers.get('X-Fetched-At') ?? '');
-    return response && age >= 0 && age < 30 * 86400000 ? response : undefined;
+    return await Promise.race([
+      (async () => {
+        const cache = await caches.open(LOCAL_CACHE);
+        const response = await cache.match(def.url);
+        const age = Date.now() - Date.parse(response?.headers.get('X-Fetched-At') ?? '');
+        return response && age >= 0 && age < 30 * 86400000 ? response : undefined;
+      })(),
+      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 500); }),
+    ]);
   } catch { return undefined; }
+  finally { clearTimeout(timer); }
 }
 
 export async function loadGroup(def: GroupDef, signal?: AbortSignal,
+  onCached?: (group: LoadedGroup) => void): Promise<LoadedGroup> {
+  if (def.key !== 'active' || !onCached) return loadObservedGroup(def, signal, onCached);
+  let best: LoadedGroup | undefined;
+  const publish = (group: LoadedGroup) => {
+    if (signal?.aborted || !group.sats.length) return;
+    // An older edge/browser cache must never roll back a newer startup copy.
+    if (best && (best.fetchedAt ?? -Infinity) > (group.fetchedAt ?? -Infinity)) return;
+    best = group;
+    onCached(group);
+  };
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  const timer = setTimeout(abort, 8000);
+  // Start independently of both optional browser storage and the live API.
+  const startup = (async () => {
+    try {
+      const response = await fetch(SNAPSHOT_PATH, { signal: controller.signal });
+      if (!response.ok) return;
+      const snapshot = readSnapshot(await response.json());
+      const parsed = parseOmm(snapshot.records);
+      publish({ ...def, ...parsed, fetchedAt: Date.parse(snapshot.fetchedAt),
+        servedStale: true, refreshState: 'revalidating', catalogSnapshot: true });
+    } catch { /* live API and browser cache are independent recovery paths */ }
+    finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+  })();
+  try {
+    const current = await loadObservedGroup(def, signal, publish);
+    publish(current);
+    await startup;
+    if (signal?.aborted) throw new Error('Aborted');
+    if (best && best !== current) return { ...best, servedStale: true,
+      refreshState: current.refreshState === 'revalidating' ? 'revalidating' : 'failed', error: current.error };
+    return current;
+  } finally { abort(); }
+}
+
+async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
   onCached?: (group: LoadedGroup) => void): Promise<LoadedGroup> {
   let saved: LoadedGroup | undefined;
   if (onCached) {
@@ -315,7 +368,8 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal,
         const parsed = parseOmm(await response.json());
         if (parsed.sats.length) {
           saved = { ...def, ...parsed, fetchedAt: Date.parse(response.headers.get('X-Fetched-At')!),
-            servedStale: true, refreshState: 'revalidating' };
+            servedStale: true, refreshState: 'revalidating',
+            catalogSnapshot: response.headers.get('X-Catalog-Snapshot') === '1' };
           onCached(saved);
         }
       } catch { /* ignore corrupt/old browser cache */ }
@@ -346,6 +400,7 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal,
       return { ...def, sats, fetchedAt: Number.isFinite(fetched) ? fetched : null,
         servedStale: res.headers.get("X-Served-Stale") === "1",
         refreshState: res.headers.get('X-Refresh-State') ?? undefined,
+        catalogSnapshot: res.headers.get('X-Catalog-Snapshot') === '1',
         rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
     } catch (error) {
       firstError = error;

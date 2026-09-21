@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { activeCatalog, loadInBatches } from '../src/catalog';
+import { activeCatalog, CATALOG_REQUESTS, loadInBatches } from '../src/catalog';
 import { GROUP_DEFS, parseOmm, type LoadedGroup } from '../src/satellites';
 import { issOmm } from './fixtures';
 
@@ -49,6 +49,20 @@ test('Amazon Leo is classified from explicit Kuiper names during a group-feed ou
   assert.deepEqual(result.find(g => g.key === 'kuiper')!.sats.map(s => s.id), ['1']);
   assert.deepEqual(result.find(g => g.key === 'starlink')!.sats.map(s => s.id), ['3']);
   assert.deepEqual(result.find(g => g.key === 'active')!.sats.map(s => s.id), ['2']);
+});
+
+test('startup does not redownload the large constellations already identified by name', () => {
+  assert.ok(CATALOG_REQUESTS.some(def => def.key === 'active'));
+  assert.ok(CATALOG_REQUESTS.some(def => def.key === 'stations'));
+  assert.ok(CATALOG_REQUESTS.every(def => !['starlink', 'oneweb', 'kuiper'].includes(def.key)));
+});
+
+test('Starlink direct-to-cell names remain classified without the duplicate membership feed', () => {
+  const active = source('active', [1, 2, 3]);
+  active.sats = active.sats.map((sat, i) => ({ ...sat, name: ['STARLINK-11072 [DTC]', 'STARLINK-1008', 'STARLINK UNKNOWN'][i] }));
+  const groups = activeCatalog([active]);
+  assert.deepEqual(groups.find(group => group.key === 'starlink')!.sats.map(sat => sat.id), ['1', '2']);
+  assert.deepEqual(groups.find(group => group.key === 'active')!.sats.map(sat => sat.id), ['3']);
 });
 
 test('catalog requests are bounded and a failed group does not stop later ones', async () => {

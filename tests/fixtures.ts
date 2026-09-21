@@ -10,3 +10,9 @@ export const tle = [
   '1 25544U 98067A   19156.50900463  .00003075  00000-0  59442-4 0  9992',
   '2 25544  51.6433  59.2583 0008217  16.4489 347.6017 15.51174618173442',
 ];
+
+export function ommCsv(records: Record<string, unknown>[]): string {
+  const headers = Object.keys(issOmm);
+  const cell = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+  return [headers.join(','), ...records.map(record => headers.map(key => cell(record[key])).join(','))].join('\r\n') + '\r\n';
+}

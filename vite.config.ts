@@ -18,9 +18,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      // The TLE endpoint lives in the Cloudflare Worker (see worker/index.js).
-      // `npm run dev:worker` serves it on 127.0.0.1:8787; without it, every
-      // group silently falls back to simulated orbits.
+      // Orbital APIs live in the Cloudflare Worker (see worker/index.js).
+      // Without the Worker, the site-hosted observed snapshot still loads.
       "/api": "http://127.0.0.1:8787",
     },
   },
