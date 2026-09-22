@@ -31,7 +31,7 @@ Rendering and orbit propagation run in the browser. A small Cloudflare Worker do
 | Control | Action |
 | --- | --- |
 | Drag / scroll / pinch | Rotate / zoom |
-| Click a satellite | Show details and its orbit |
+| Click / tap a satellite | Select the nearest visible dot and open its details and orbit |
 | `/` | Focus satellite search |
 | Arrow down/up in results | Browse search results |
 | Enter | Select a result (or the first match from the search input) |
@@ -47,6 +47,8 @@ Rendering and orbit propagation run in the browser. A small Cloudflare Worker do
 | Upcoming passes → View peak | Pause at the predicted pass peak |
 
 The main clock is UTC. Date entry is explicitly labeled with the browser's local timezone. Pass times are UTC. On smaller screens the constellation drawer and extra time controls start collapsed; the satellite detail panel can also be collapsed.
+
+Satellite selection uses the current rendered positions with a consistent screen-pixel target at every zoom level and a larger target for touch. Hover shows the satellite's name. Hidden satellites and objects behind Earth cannot intercept clicks; camera drags and pinch gestures do not select objects. Clicking empty space keeps the current details open; use `Esc` or the close button to deselect.
 
 ## Development
 

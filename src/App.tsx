@@ -50,7 +50,16 @@ export default function App() {
   useEffect(() => {
     if (!canvas.current) return;
     let scene: Engine;
-    try { scene = createEngine(canvas.current, (t, f) => { setSimTime(t); setFps(f); }, setSelection); }
+    let selectedId: string | undefined;
+    const onSelection = (next: SatSelection | null, revealDetails = false) => {
+      setSelection(next);
+      if (next && (revealDetails || next.id !== selectedId)) {
+        setDetailsOpen(true);
+        if (window.innerWidth < 760) setPanelOpen(false);
+      }
+      selectedId = next?.id;
+    };
+    try { scene = createEngine(canvas.current, (t, f) => { setSimTime(t); setFps(f); }, onSelection); }
     catch { setEngineError('The 3D view needs WebGL. Enable hardware acceleration or try another browser.'); return; }
     engine.current = scene;
     const controller = new AbortController();
@@ -253,6 +262,6 @@ export default function App() {
       <div className="playback-row"><button className="play-button" aria-label={paused ? 'Play simulation' : 'Pause simulation'} title="Space to play/pause" onClick={() => setPaused(p => !p)}>{paused ? '▶' : 'Ⅱ'}</button><button className={`action reverse-button ${reverse ? 'active' : ''}`} aria-label="Reverse time" aria-pressed={reverse} onClick={() => setReverse(r => !r)}>↶</button><label className="speed-control"><span className="sr-only">Playback speed</span><input type="range" min="0" max="5" step="0.01" value={exp} aria-valuetext={`${formatSpeed(speed)}${reverse ? ', reverse' : ', forward'}`} onChange={e => setExp(Number(e.target.value))} /></label><output className="speed-output">{formatSpeed(speed)}</output><div className="presets">{PRESETS.map((p, i) => <button className={`action small ${Math.abs(exp - Math.log10(p)) < 0.001 ? 'active' : ''}`} aria-pressed={Math.abs(exp - Math.log10(p)) < 0.001} key={p} onClick={() => setExp(Math.log10(p))}>{PRESET_LABELS[i]}</button>)}</div></div>
       <div id="time-settings" className="time-settings"><form onSubmit={e => { e.preventDefault(); applyDate(); }}><label htmlFor="simulation-date">Jump to local time <span>({timezone})</span></label><div className="date-row"><input id="simulation-date" type="datetime-local" min="1957-01-01T00:00" max="2100-12-31T23:59" value={dateInput} onFocus={() => setEditingDate(true)} onBlur={() => { if (!dateInput) setDateInput(localInput(simTime)); }} onChange={e => { setEditingDate(true); setDateInput(e.target.value); }} aria-describedby={dateError ? 'date-error' : undefined} /><button className="action" type="submit">Jump & pause</button></div></form>{dateError && <p id="date-error" role="alert" className="notice">{dateError}</p>}</div>
     </footer>
-    <p className="canvas-hint">Drag to rotate · Scroll to zoom · / to search · Space to pause</p>
+    <p className="canvas-hint">Click a satellite for details · Drag to rotate · Scroll to zoom</p>
   </main>;
 }

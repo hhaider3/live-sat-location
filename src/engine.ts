@@ -16,6 +16,7 @@ import {
 import PropagationWorker from './propagation.worker?worker&inline';
 import { buildSnapshot, interpolatePositions, snapshotTime, type PropagationRequest, type Snapshot } from './propagation';
 import { SimulationClock } from './time';
+import { pickSatellite, SatelliteTapGesture } from './picking';
 
 const KM_TO_UNITS = 1 / 1000; // 1 scene unit = 1000 km
 const EARTH_RADIUS = 6371 * KM_TO_UNITS;
@@ -141,13 +142,13 @@ const eciToScene = (p: { x: number; y: number; z: number }, out: THREE.Vector3) 
 export function createEngine(
   container: HTMLElement,
   onTick?: (simTimeMs: number, fps: number) => void,
-  onSelect?: (selection: SatSelection | null) => void
+  onSelect?: (selection: SatSelection | null, revealDetails?: boolean) => void
 ): Engine {
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(container.clientWidth, container.clientHeight);
   container.appendChild(renderer.domElement);
-  renderer.domElement.setAttribute("aria-label", "3D Earth and satellite orbits. Use satellite search to select an object with the keyboard.");
+  renderer.domElement.setAttribute("aria-label", "3D Earth and satellite orbits. Click or tap a satellite for details, or use satellite search with the keyboard.");
   renderer.domElement.setAttribute("role", "img");
 
   const scene = new THREE.Scene();
@@ -443,6 +444,7 @@ export function createEngine(
 
   // Engine-owned tooltip so hover never triggers React renders.
   const tooltip = document.createElement("div");
+  tooltip.setAttribute('role', 'tooltip');
   tooltip.style.cssText = [
     "position:absolute",
     "left:0",
@@ -460,51 +462,14 @@ export function createEngine(
   ].join(";");
   container.appendChild(tooltip);
 
-  const raycaster = new THREE.Raycaster();
-  const ndc = new THREE.Vector2();
-  const earthSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), EARTH_RADIUS);
-  const pickDir = new THREE.Vector3();
-  const pickRay = new THREE.Ray();
-  const sphereHit = new THREE.Vector3();
-
   let pointerX = 0;
   let pointerY = 0;
   let pointerMoved = false;
   let pointerIsMouse = false;
-  let downX = 0;
-  let downY = 0;
+  const tapGesture = new SatelliteTapGesture();
 
-  function isOccludedByEarth(p: THREE.Vector3): boolean {
-    pickDir.subVectors(p, camera.position);
-    const dist = pickDir.length();
-    pickRay.origin.copy(camera.position);
-    pickRay.direction.copy(pickDir.normalize());
-    const hit = pickRay.intersectSphere(earthSphere, sphereHit);
-    return hit !== null && camera.position.distanceTo(hit) < dist - 1e-4;
-  }
-
-  function pickAt(x: number, y: number): { g: GroupRender; i: number } | null {
-    const visible = groupRenders.filter((g) => g.points.visible);
-    if (visible.length === 0) return null;
-    const rect = renderer.domElement.getBoundingClientRect();
-    ndc.set(
-      ((x - rect.left) / rect.width) * 2 - 1,
-      -((y - rect.top) / rect.height) * 2 + 1
-    );
-    raycaster.setFromCamera(ndc, camera);
-    raycaster.params.Points.threshold = Math.max(0.1, camera.position.distanceTo(controls.target) * 0.007);
-    const hits = raycaster.intersectObjects(
-      visible.map((g) => g.points),
-      false
-    );
-    for (const hit of hits) {
-      if (hit.index === undefined) continue;
-      const g = visible.find((gr) => gr.points === hit.object);
-      if (!g || g.positions[hit.index * 3] >= HIDDEN * 0.5) continue;
-      const actual = new THREE.Vector3().fromArray(g.positions, hit.index * 3);
-      if (!isOccludedByEarth(actual)) return { g, i: hit.index };
-    }
-    return null;
+  function pickAt(x: number, y: number, radius = 8): { g: GroupRender; i: number } | null {
+    return pickSatellite(groupRenders, camera, renderer.domElement.getBoundingClientRect(), x, y, EARTH_RADIUS, radius);
   }
 
   function rebuildOrbit() {
@@ -530,7 +495,7 @@ export function createEngine(
     if (trackOk) (trackGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   }
 
-  function emitSelection() {
+  function emitSelection(revealDetails = false) {
     if (!onSelect) return;
     if (!selected) {
       onSelect(null);
@@ -552,10 +517,10 @@ export function createEngine(
       following,
       altitudeKm: gd?.altitudeKm ?? NaN,
       velocityKmS: st ? Math.hypot(st.vx, st.vy, st.vz) : NaN,
-    });
+    }, revealDetails);
   }
 
-  function selectTarget(target: { g: GroupRender; i: number } | null) {
+  function selectTarget(target: { g: GroupRender; i: number } | null, revealDetails = false) {
     if (disposed) {
       selected = null;
       return;
@@ -572,27 +537,28 @@ export function createEngine(
       track.visible = false;
     }
     if (wasFollowing) setFollowing(!!selected);
-    emitSelection();
+    emitSelection(revealDetails);
   }
 
   const onPointerDown = (e: PointerEvent) => {
-    if (e.button !== 0) return;
-    downX = e.clientX;
-    downY = e.clientY;
+    tapGesture.down(e);
+    tooltip.style.display = 'none';
   };
   const onPointerMove = (e: PointerEvent) => {
+    tapGesture.move(e);
     pointerX = e.clientX;
     pointerY = e.clientY;
     pointerIsMouse = e.pointerType === "mouse";
     pointerMoved = true;
   };
   const onPointerUp = (e: PointerEvent) => {
-    if (e.button !== 0) return;
-    // Only treat it as a click when the drag never really started; otherwise
-    // it was a camera rotate/zoom.
-    if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
-    selectTarget(pickAt(e.clientX, e.clientY));
+    if (!tapGesture.up(e)) return;
+    const target = pickAt(e.clientX, e.clientY, e.pointerType === 'touch' ? 18 : 8);
+    // A miss shouldn't dismiss details while someone is aiming at a tiny dot.
+    if (target) selectTarget(target, true);
+    pointerMoved = true;
   };
+  const onPointerCancel = (e: PointerEvent) => { tapGesture.cancel(e); onPointerLeave(); };
   const onPointerLeave = () => {
     pointerMoved = false;
     tooltip.style.display = "none";
@@ -605,14 +571,16 @@ export function createEngine(
   renderer.domElement.addEventListener("pointermove", onPointerMove);
   renderer.domElement.addEventListener("pointerup", onPointerUp);
   renderer.domElement.addEventListener("pointerleave", onPointerLeave);
+  renderer.domElement.addEventListener('pointercancel', onPointerCancel);
+  renderer.domElement.addEventListener('lostpointercapture', onPointerCancel);
   window.addEventListener("keydown", onKeyDown);
 
   function updateHover() {
-    if (!pointerMoved || !pointerIsMouse) return;
+    if (!pointerMoved || !pointerIsMouse || tapGesture.active) return;
     pointerMoved = false;
     const target = pickAt(pointerX, pointerY);
     if (target) {
-      tooltip.textContent = `${target.g.sats[target.i].name} · ${target.g.label}`;
+      tooltip.textContent = `${target.g.sats[target.i].name} · Click for details`;
       const rect = renderer.domElement.getBoundingClientRect();
       tooltip.style.transform = `translate(${pointerX - rect.left + 14}px, ${
         pointerY - rect.top - 34
@@ -720,7 +688,7 @@ export function createEngine(
       const g = groupRenders.find(g => g.key === key);
       const i = g?.sats.findIndex(s => s.id === id) ?? -1;
       if (!g || i < 0) return;
-      selectTarget({ g, i });
+      selectTarget({ g, i }, true);
       if (!following) {
         const p = eciPosition(g.sats[i], new Date(simTime));
         if (p) {
@@ -761,6 +729,8 @@ export function createEngine(
       renderer.domElement.removeEventListener("pointermove", onPointerMove);
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
       renderer.domElement.removeEventListener("pointerleave", onPointerLeave);
+      renderer.domElement.removeEventListener('pointercancel', onPointerCancel);
+      renderer.domElement.removeEventListener('lostpointercapture', onPointerCancel);
       timer.dispose();
       controls.dispose();
       clearGroupRenders();
