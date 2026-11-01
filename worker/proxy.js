@@ -1,6 +1,7 @@
 import { normalizeOmm } from '../shared/omm.ts';
 import { parseOmmCsv } from '../shared/csv.ts';
 import { assetSnapshot, fetchMirrorSnapshot, snapshotResponse } from './snapshot.js';
+import { readStored, storedMetadata, writeStored } from './store.js';
 
 export const CACHE_TTL_SECONDS = 2 * 60 * 60;
 export const STALE_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -8,6 +9,9 @@ const ALLOWED_GROUPS = new Set([
   'starlink', 'oneweb', 'gps-ops', 'glo-ops', 'galileo', 'beidou',
   'iridium-NEXT', 'stations', 'geo', 'science', 'kuiper', 'active',
 ]);
+// The groups the frontend requests. Named constellations come from the active feed.
+const STORED_GROUPS = ['active', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'iridium-NEXT', 'stations', 'geo', 'science'];
+const MIN_ACTIVE_RECORDS = 10000;
 
 export function errorResponse(message, status, extraHeaders = {}) {
   return new Response(message, { status, headers: {
@@ -54,9 +58,20 @@ async function serveCached(requestUrl, ctx, refresh, env) {
     cache.match(key).catch(() => null), cache.match(stateKey).catch(() => null),
   ]);
   const now = Date.now();
-  const fetched = Date.parse(cached?.headers.get('X-Fetched-At') ?? '');
-  const age = now - fetched;
+  let fetched = Date.parse(cached?.headers.get('X-Fetched-At') ?? '');
+  let age = now - fetched;
   if (cached && age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
+  if (requestUrl.pathname === '/api/omm') {
+    const stored = await readStored(env, group);
+    const storedAt = Date.parse(stored?.headers.get('X-Fetched-At') ?? '');
+    if (stored && !(storedAt <= fetched)) {
+      cached = stored;
+      fetched = storedAt;
+      age = now - fetched;
+      await cache.put(key, stored.clone()).catch(() => {});
+      if (age >= 0 && age < CACHE_TTL_SECONDS * 1000) return clientResponse(cached);
+    } else void stored?.body?.cancel().catch(() => {});
+  }
   const retentionAge = Number.isFinite(age) ? age
     : now - Date.parse(cached?.headers.get('Last-Modified') ?? '');
   let usable = cached && retentionAge >= 0 && retentionAge < STALE_TTL_SECONDS * 1000;
@@ -118,8 +133,10 @@ async function serveCached(requestUrl, ctx, refresh, env) {
     if (waiting && state.headers.get('X-Upstream-Error')) response.headers.set('X-Upstream-Error', state.headers.get('X-Upstream-Error'));
     return response;
   }
+  // A refresh in progress is a short lock, not a cooldown: it usually ends in seconds.
+  const retrySeconds = Math.ceil((retryAt - now) / 1000);
   if (waiting) return errorResponse('Orbital data source is unavailable', 503, {
-    'Retry-After': String(Math.ceil((retryAt - now) / 1000)),
+    'Retry-After': String(status === 'revalidating' ? Math.min(retrySeconds, 5) : retrySeconds),
     'X-Upstream-Error': state.headers.get('X-Upstream-Error') ?? 'refresh-in-progress',
   });
   return run();
@@ -159,38 +176,74 @@ async function refreshOmm(requestUrl, ctx) {
     return response;
   };
 
-  const upstreamUrl = new URL('https://celestrak.org/NORAD/elements/gp.php');
-  upstreamUrl.searchParams.set('GROUP', group);
-  upstreamUrl.searchParams.set('FORMAT', 'CSV');
   const controller = new AbortController();
   // Leave room for the independent mirror inside waitUntil's 30-second budget.
   const timer = setTimeout(() => controller.abort(), group === 'active' ? 15000 : cached ? 25000 : 10000);
   try {
-    const upstream = await fetch(upstreamUrl, { signal: controller.signal, headers: {
-      Accept: 'text/csv',
-      'User-Agent': 'live-sat-location/2.0 (+https://github.com/hhaider3/live-sat-location)',
-    } });
-    if (!upstream.ok) return fallback(`http-${upstream.status}`);
-    const data = parseOmmCsv(await upstream.text());
-    const records = data.map(normalizeOmm).filter(Boolean);
-    if (!records.length) return fallback('invalid-data');
-    if (group === 'active' && (records.length < 10000 ||
-        (cached && records.length < (await cached.clone().json()).length * 0.8))) return fallback('invalid-data');
+    const { records, rejected } = await downloadOmm(group, controller.signal);
+    if (group === 'active' && cached && records.length < (await cached.clone().json()).length * 0.8) return fallback('invalid-data');
     const response = new Response(JSON.stringify(records), { headers: {
       'Cache-Control': `public, max-age=${STALE_TTL_SECONDS}`,
       'Content-Type': 'application/json; charset=utf-8',
       'X-Content-Type-Options': 'nosniff',
       'X-Fetched-At': new Date().toISOString(),
       'X-Served-Stale': '0',
-      'X-Rejected-Records': String(data.length - records.length),
+      'X-Rejected-Records': String(rejected),
     } });
     if (cache) ctx.waitUntil(cache.put(key, response.clone()).catch(() => {}));
     return clientResponse(response);
-  } catch {
-    return fallback(controller.signal.aborted ? 'timeout' : 'request-or-parse-failed');
+  } catch (error) {
+    return fallback(error.reason ?? (controller.signal.aborted ? 'timeout' : 'request-or-parse-failed'));
   } finally {
     clearTimeout(timer);
   }
+}
+
+const upstreamFailure = reason => Object.assign(new Error(reason), { reason });
+
+async function downloadOmm(group, signal) {
+  const upstreamUrl = new URL('https://celestrak.org/NORAD/elements/gp.php');
+  upstreamUrl.searchParams.set('GROUP', group);
+  upstreamUrl.searchParams.set('FORMAT', 'CSV');
+  const upstream = await fetch(upstreamUrl, { signal, headers: {
+    Accept: 'text/csv',
+    'User-Agent': 'live-sat-location/2.0 (+https://github.com/hhaider3/live-sat-location)',
+  } });
+  if (!upstream.ok) throw upstreamFailure(`http-${upstream.status}`);
+  const data = parseOmmCsv(await upstream.text());
+  const records = data.map(normalizeOmm).filter(Boolean);
+  if (!records.length || (group === 'active' && records.length < MIN_ACTIVE_RECORDS)) throw upstreamFailure('invalid-data');
+  return { records, rejected: data.length - records.length };
+}
+
+async function refreshStoredGroup(env, group, previous) {
+  try {
+    const { records, rejected } = await downloadOmm(group, AbortSignal.timeout(30000));
+    // The same protection as the request path: a shrunken feed keeps the last good copy.
+    if (group === 'active' && previous?.count && records.length < previous.count * 0.8) throw upstreamFailure('invalid-data');
+    await writeStored(env, group, records, { fetchedAt: new Date().toISOString(), count: records.length, rejected });
+  } catch (error) {
+    if (group !== 'active') throw error;
+    const snapshot = await fetchMirrorSnapshot(AbortSignal.timeout(30000));
+    if (Date.parse(snapshot.fetchedAt) > Date.parse(previous?.fetchedAt ?? '') || !previous?.fetchedAt) {
+      await writeStored(env, group, snapshot.records, { fetchedAt: snapshot.fetchedAt,
+        count: snapshot.records.length, rejected: 0, source: snapshot.source });
+      console.warn(`Active catalog refreshed from the mirror: ${error.message}`);
+    } else throw error;
+  }
+}
+
+/** Cron entry point. One failed group keeps its last good copy and cannot block the rest. */
+export async function refreshStoredCatalogs(env) {
+  if (!env?.CATALOG) return;
+  const previous = await storedMetadata(env);
+  const failures = [];
+  for (const group of STORED_GROUPS) {
+    try { await refreshStoredGroup(env, group, previous.get(group)); }
+    catch (error) { failures.push(`${group}: ${error.message}`); }
+  }
+  // Rejecting marks this run as failed in Cloudflare's Cron Events.
+  if (failures.length) throw new Error(`Catalog refresh failed for ${failures.join('; ')}`);
 }
 
 // Kept for clients during a rolling deployment and as an outage fallback. The

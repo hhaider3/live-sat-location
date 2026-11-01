@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { parseOmmCsv } from '../shared/csv';
-import { ACTIVE_SOURCE, readSnapshot, SNAPSHOT_PATH } from '../shared/snapshot';
-import { GROUP_DEFS, loadGroup, parseOmm, eciState, type LoadedGroup } from '../src/satellites';
+import { ACTIVE_SOURCE, readSnapshot, SNAPSHOT_MAX_AGE_MS, SNAPSHOT_PATH } from '../shared/snapshot';
+import { GROUP_DEFS, loadGroup, parseOmm, eciState, SNAPSHOT_HEAD_START_MS, type LoadedGroup } from '../src/satellites';
 import { issOmm, ommCsv } from './fixtures';
 
 const active = GROUP_DEFS.find(def => def.key === 'active')!;
@@ -19,6 +19,7 @@ function storage(t: TestContext, open: () => Promise<unknown>) {
 
 test('first visitor sees observed satellites before a stalled API, without browser storage', async t => {
   storage(t, async () => { throw new Error('Storage disabled'); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   let finish!: (response: Response) => void;
   let displayed!: (group: LoadedGroup) => void;
   const visible = new Promise<LoadedGroup>(resolve => { displayed = resolve; });
@@ -29,6 +30,7 @@ test('first visitor sees observed satellites before a stalled API, without brows
     return new Promise<Response>(resolve => { finish = resolve; });
   });
   const pending = loadGroup(active, undefined, displayed);
+  t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
   const group = await visible;
   assert.equal(group.sats[0].kind, 'sgp4');
   assert.equal(group.fetchedAt, Date.parse(fetchedAt));
@@ -38,11 +40,45 @@ test('first visitor sees observed satellites before a stalled API, without brows
   assert.equal(result.sats.length, 1);
   assert.equal(result.refreshState, 'failed');
   assert.equal(result.fetchedAt, Date.parse(fetchedAt));
+  assert.ok(result.retryAt! > Date.now());
   assert.deepEqual(requests.sort(), [active.url, SNAPSHOT_PATH].sort());
+});
+
+test('a healthy API does not download the catalog a second time', async t => {
+  storage(t, async () => ({ match: async () => undefined }));
+  const requests: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string) => {
+    requests.push(url);
+    return Response.json([issOmm], { headers: { 'X-Fetched-At': new Date().toISOString() } });
+  });
+  assert.equal((await loadGroup(active, undefined, () => {})).sats.length, 1);
+  assert.deepEqual(requests, [active.url]);
+});
+
+test('a failing API starts the startup catalog without waiting for the head start', async t => {
+  storage(t, async () => ({ match: async () => undefined }));
+  t.mock.method(globalThis, 'fetch', async (url: string) => url === SNAPSHOT_PATH
+    ? Response.json(snapshot) : new Response('down', { status: 500 }));
+  const result = await loadGroup(active, undefined, () => {});
+  assert.equal(result.sats[0].id, '25544');
+  assert.equal(result.catalogSnapshot, true);
+  assert.equal(result.refreshState, 'failed');
+});
+
+test('a response with Retry-After reports when to retry, within a bounded wait', async t => {
+  const stations = GROUP_DEFS.find(def => def.key === 'stations')!;
+  for (const [header, seconds] of [['5', 5], ['7200', 300]] as const) {
+    t.mock.method(globalThis, 'fetch', async () => new Response('down', { status: 503, headers: { 'Retry-After': header } }));
+    const before = Date.now();
+    const { retryAt } = await loadGroup(stations);
+    assert.ok(retryAt! >= before + seconds * 1000 && retryAt! <= Date.now() + seconds * 1000);
+    t.mock.restoreAll();
+  }
 });
 
 test('live recovery replaces the startup catalog and preserves the newer fetch timestamp', async t => {
   storage(t, async () => ({ match: async () => undefined }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   let finish!: (response: Response) => void;
   let displayed!: () => void;
   const visible = new Promise<void>(resolve => { displayed = resolve; });
@@ -52,6 +88,7 @@ test('live recovery replaces the startup catalog and preserves the newer fetch t
   t.mock.method(globalThis, 'fetch', async (url: string) => url === SNAPSHOT_PATH
     ? Response.json(snapshot) : new Promise<Response>(resolve => { finish = resolve; started(); }));
   const pending = loadGroup(active, undefined, displayed);
+  t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
   await Promise.all([visible, ready]);
   finish(Response.json([{ ...issOmm, NORAD_CAT_ID: 100608 }], { headers: { 'X-Fetched-At': newer } }));
   const result = await pending;
@@ -62,13 +99,20 @@ test('live recovery replaces the startup catalog and preserves the newer fetch t
 
 test('an older live response cannot erase or roll back a newer startup catalog', async t => {
   storage(t, async () => ({ match: async () => undefined }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const published: LoadedGroup[] = [];
+  let finish!: (response: Response) => void;
+  let displayed!: () => void;
+  const visible = new Promise<void>(resolve => { displayed = resolve; });
   t.mock.method(globalThis, 'fetch', async (url: string) => url === SNAPSHOT_PATH
-    ? Response.json(snapshot)
-    : Response.json([{ ...issOmm, NORAD_CAT_ID: 100608 }], { headers: {
-      'X-Fetched-At': new Date(Date.now() - 86400000).toISOString(),
-    } }));
-  const result = await loadGroup(active, undefined, group => published.push(group));
+    ? Response.json(snapshot) : new Promise<Response>(resolve => { finish = resolve; }));
+  const pending = loadGroup(active, undefined, group => { published.push(group); displayed(); });
+  t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
+  await visible;
+  finish(Response.json([{ ...issOmm, NORAD_CAT_ID: 100608 }], { headers: {
+    'X-Fetched-At': new Date(Date.now() - 86400000).toISOString(),
+  } }));
+  const result = await pending;
   assert.equal(result.sats[0].id, '25544');
   assert.equal(published.at(-1)!.sats[0].id, '25544');
   assert.equal(result.fetchedAt, Date.parse(fetchedAt));
@@ -76,27 +120,31 @@ test('an older live response cannot erase or roll back a newer startup catalog',
 
 test('a late startup response cannot replace a newer live catalog', async t => {
   storage(t, async () => ({ match: async () => undefined }));
-  let finish!: (response: Response) => void;
-  let displayed!: () => void;
-  const visible = new Promise<void>(resolve => { displayed = resolve; });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const published: LoadedGroup[] = [];
-  t.mock.method(globalThis, 'fetch', async (url: string) => url === SNAPSHOT_PATH
-    ? new Promise<Response>(resolve => { finish = resolve; })
-    : Response.json([{ ...issOmm, NORAD_CAT_ID: 100608 }], { headers: { 'X-Fetched-At': new Date().toISOString() } }));
-  const pending = loadGroup(active, undefined, group => { published.push(group); displayed(); });
-  await visible;
-  finish(Response.json(snapshot));
+  let startupSignal!: AbortSignal;
+  t.mock.method(globalThis, 'fetch', async (url: string, options: RequestInit) => {
+    if (url !== SNAPSHOT_PATH) return Response.json([{ ...issOmm, NORAD_CAT_ID: 100608 }], { headers: { 'X-Fetched-At': new Date().toISOString() } });
+    startupSignal = options.signal!;
+    return new Promise<Response>(() => {});
+  });
+  const pending = loadGroup(active, undefined, group => published.push(group));
+  t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
   assert.equal((await pending).sats[0].id, '100608');
   assert.deepEqual(published.map(group => group.sats[0].id), ['100608']);
+  assert.ok(startupSignal.aborted);
 });
 
 test('expired, corrupt and missing startup assets do not block the live API', async t => {
   storage(t, async () => { throw new Error('Storage disabled'); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   for (const response of [new Response('missing', { status: 404 }), new Response('<html>app</html>'),
     Response.json({ ...snapshot, fetchedAt: new Date(Date.now() - 31 * 86400000).toISOString() })]) {
     t.mock.method(globalThis, 'fetch', async (url: string) => url === SNAPSHOT_PATH ? response
       : Response.json([issOmm], { headers: { 'X-Fetched-At': fetchedAt } }));
-    const result = await loadGroup(active, undefined, () => {});
+    const pending = loadGroup(active, undefined, () => {});
+    t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
+    const result = await pending;
     assert.equal(result.sats.length, 1);
     assert.equal(result.catalogSnapshot, false);
     t.mock.restoreAll();
@@ -105,6 +153,7 @@ test('expired, corrupt and missing startup assets do not block the live API', as
 
 test('cancelling startup aborts both requests and does not publish a fallback', async t => {
   storage(t, async () => ({ match: async () => undefined }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const controller = new AbortController();
   let start!: () => void;
   const ready = new Promise<void>(resolve => { start = resolve; });
@@ -115,6 +164,7 @@ test('cancelling startup aborts both requests and does not publish a fallback', 
     return new Promise<Response>((_resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('Aborted'))));
   });
   const pending = loadGroup(active, controller.signal, () => assert.fail('cancelled load must not publish'));
+  t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
   await ready; controller.abort();
   await assert.rejects(pending, /Aborted/);
   assert.ok(signals.every(signal => signal.aborted));
@@ -128,6 +178,12 @@ test('a hanging browser cache cannot hold up the API indefinitely', async t => {
   const pending = loadGroup(active, undefined, () => {});
   t.mock.timers.tick(501);
   assert.equal((await pending).sats.length, 1);
+});
+
+test('the shipped startup asset is refreshed well before it expires', async () => {
+  const { fetchedAt: saved } = JSON.parse(await readFile('public/data/active.json', 'utf8'));
+  const remainingDays = (Date.parse(saved) + SNAPSHOT_MAX_AGE_MS - Date.now()) / 86400000;
+  assert.ok(remainingDays > 7, `The startup catalog expires in ${remainingDays.toFixed(1)} days. Run npm run snapshot:update and deploy.`);
 });
 
 test('CSV preserves extended IDs, quoted names, column order and SGP4 propagation', () => {
