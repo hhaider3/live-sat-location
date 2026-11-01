@@ -34,6 +34,8 @@ export interface LoadedGroup extends GroupDef {
   catalogSnapshot?: boolean;
   rejectedCount: number;
   error?: string;
+  /** When the Worker asked to be retried, in epoch milliseconds. */
+  retryAt?: number;
 }
 
 const KEPLER_EPOCH_MS = Date.UTC(2024, 0, 1);
@@ -295,7 +297,26 @@ export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } 
   return { sats, rejectedCount: data.length - sats.length };
 }
 
+export type CatalogKind = 'omm' | 'snapshot';
+export interface ParsedCatalog { sats: Sat[]; rejectedCount: number; fetchedAt?: number }
+type CatalogParser = (body: ArrayBuffer, kind: CatalogKind) => Promise<ParsedCatalog>;
+
+export function parseCatalogBody(body: ArrayBuffer, kind: CatalogKind): ParsedCatalog {
+  const data = JSON.parse(new TextDecoder().decode(body));
+  if (kind === 'omm') return parseOmm(data);
+  const snapshot = readSnapshot(data);
+  return { ...parseOmm(snapshot.records), fetchedAt: Date.parse(snapshot.fetchedAt) };
+}
+
+let parseCatalog: CatalogParser = async (body, kind) => parseCatalogBody(body, kind);
+/** The app supplies a Worker-backed parser so a large catalog cannot stall the page. */
+export function setCatalogParser(parser: CatalogParser) { parseCatalog = parser; }
+
 const LOCAL_CACHE = 'orbit-observations-v1';
+// Cold regions answer from the Worker's stored catalog, so a healthy API
+// responds well inside this. Only a stalled API costs the second download.
+export const SNAPSHOT_HEAD_START_MS = 2500;
+const MAX_RETRY_SECONDS = 300;
 
 // Persist only observed OMM responses. Storage denial/eviction is harmless;
 // neither synthetic fallback nor a failed request can overwrite this copy.
@@ -330,42 +351,49 @@ export async function loadGroup(def: GroupDef, signal?: AbortSignal,
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   if (signal?.aborted) abort();
-  const timer = setTimeout(abort, 8000);
-  // Start independently of both optional browser storage and the live API.
-  const startup = (async () => {
+  let startup: Promise<void> | undefined;
+  const startSnapshot = () => startup ??= (async () => {
+    // Covers the download too, so it must allow for a slow connection.
+    const timer = setTimeout(abort, 60000);
     try {
       const response = await fetch(SNAPSHOT_PATH, { signal: controller.signal });
       if (!response.ok) return;
-      const snapshot = readSnapshot(await response.json());
-      const parsed = parseOmm(snapshot.records);
-      publish({ ...def, ...parsed, fetchedAt: Date.parse(snapshot.fetchedAt),
+      const parsed = await parseCatalog(await response.arrayBuffer(), 'snapshot');
+      if (controller.signal.aborted) return;
+      publish({ ...def, ...parsed, fetchedAt: parsed.fetchedAt!,
         servedStale: true, refreshState: 'revalidating', catalogSnapshot: true });
     } catch { /* live API and browser cache are independent recovery paths */ }
-    finally {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', abort);
-    }
+    finally { clearTimeout(timer); }
   })();
+  const headStart = setTimeout(() => { if (!best) void startSnapshot(); }, SNAPSHOT_HEAD_START_MS);
   try {
-    const current = await loadObservedGroup(def, signal, publish);
+    const current = await loadObservedGroup(def, signal, publish, ok => {
+      clearTimeout(headStart);
+      if (!ok) void startSnapshot();
+    });
     publish(current);
-    await startup;
+    if (!current.sats.length || current.error) await startSnapshot();
     if (signal?.aborted) throw new Error('Aborted');
     if (best && best !== current) return { ...best, servedStale: true,
-      refreshState: current.refreshState === 'revalidating' ? 'revalidating' : 'failed', error: current.error };
+      refreshState: current.refreshState === 'revalidating' ? 'revalidating' : 'failed',
+      error: current.error, retryAt: current.retryAt };
     return current;
-  } finally { abort(); }
+  } finally {
+    clearTimeout(headStart);
+    signal?.removeEventListener('abort', abort);
+    abort();
+  }
 }
 
 async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
-  onCached?: (group: LoadedGroup) => void): Promise<LoadedGroup> {
+  onCached?: (group: LoadedGroup) => void, onResponse?: (ok: boolean) => void): Promise<LoadedGroup> {
   let saved: LoadedGroup | undefined;
   if (onCached) {
     const response = await savedResponse(def);
     if (signal?.aborted) throw new Error('Aborted');
     if (response) {
       try {
-        const parsed = parseOmm(await response.json());
+        const parsed = await parseCatalog(await response.arrayBuffer(), 'omm');
         if (parsed.sats.length) {
           saved = { ...def, ...parsed, fetchedAt: Date.parse(response.headers.get('X-Fetched-At')!),
             servedStale: true, refreshState: 'revalidating',
@@ -384,16 +412,19 @@ async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
     let firstError: unknown;
     try {
       const res = await fetch(def.url, { signal: ctrl.signal, cache: 'no-cache' });
+      onResponse?.(res.ok);
       // The Worker has already tried the source and scheduled a retry. Asking
       // the same provider for TLEs would add another timeout and another error.
       if (!res.ok && res.headers.has('Retry-After')) {
-        return saved ? { ...saved, refreshState: 'failed' }
+        const seconds = Number(res.headers.get('Retry-After'));
+        const retryAt = Date.now() + Math.min(Number.isFinite(seconds) ? seconds : 60, MAX_RETRY_SECONDS) * 1000;
+        return saved ? { ...saved, refreshState: 'failed', retryAt }
           : { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
-            rejectedCount: 0, error: 'Orbital source unavailable; retry scheduled' };
+            rejectedCount: 0, error: 'Orbital source unavailable; retry scheduled', retryAt };
       }
       if (!res.ok) throw new Error(`OMM request failed (${res.status})`);
       const toSave = res.clone();
-      const { sats, rejectedCount } = parseOmm(await res.json());
+      const { sats, rejectedCount } = await parseCatalog(await res.arrayBuffer(), 'omm');
       if (!sats.length) throw new Error("No usable OMM records");
       void (async () => { try { await (await caches.open(LOCAL_CACHE)).put(def.url, toSave); } catch { /* optional storage */ } })();
       const fetched = Date.parse(res.headers.get("X-Fetched-At") ?? "");
@@ -404,6 +435,7 @@ async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
         rejectedCount: rejectedCount + (Number(res.headers.get("X-Rejected-Records")) || 0) };
     } catch (error) {
       firstError = error;
+      onResponse?.(false);
     }
     // Each request gets its own timeout. An OMM timeout must not abort the
     // compatibility request before it starts. Caller cancellation still wins.

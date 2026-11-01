@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createEngine, DEFAULT_DISPLAY, type Engine, type SatSelection } from './engine';
-import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, type LoadedGroup, type Sat } from './satellites';
+import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGroup, setCatalogParser, type LoadedGroup, type Sat } from './satellites';
+import { parseCatalogInWorker } from './catalogParser';
 import { formatSpeed } from './time';
 import PassPlanner from './PassPlanner';
 import { activeCatalog, CATALOG_REQUESTS, loadInBatches } from './catalog';
+
+setCatalogParser(parseCatalogInWorker);
 
 const PRESETS = [1, 60, 600, 3600, 86400];
 const PRESET_LABELS = ['1×', '60×', '10 min/s', '1 h/s', '1 d/s'];
@@ -64,7 +67,9 @@ export default function App() {
     engine.current = scene;
     const controller = new AbortController();
     let cancelled = false;
-    let fetching = false;
+    // Tracked per group, so a slow membership feed cannot hold up a catalog retry.
+    const inFlight = new Set<string>();
+    let retryTimer: number | undefined;
     const lastAttempt = new Map<string, number>();
     const sources = new Map<string, LoadedGroup>();
     const publish = (next: LoadedGroup) => {
@@ -74,18 +79,30 @@ export default function App() {
       scene.setGroups(groupsRef.current);
       groupsRef.current.forEach(g => scene.setGroupVisible(g.key, visibilityRef.current.get(g.key) ?? true));
       setGroups([...groupsRef.current]);
+      // The texture is decoration: it should not compete with the catalog download.
+      if (groupsRef.current.some(g => g.sats.length)) scene.loadEarthTexture();
+    };
+    const scheduleRetry = () => {
+      clearTimeout(retryTimer);
+      const retries = [...sources.values()].flatMap(g => g.retryAt && !inFlight.has(g.key) ? g.retryAt : []);
+      if (retries.length) retryTimer = window.setTimeout(() => {
+        if (!document.hidden) void refresh();
+      }, Math.max(0, Math.min(...retries) - Date.now()));
     };
     const refresh = async (force = false) => {
-      if (fetching || cancelled) return;
+      if (cancelled) return;
       const due = CATALOG_REQUESTS.filter(def => {
+        if (inFlight.has(def.key)) return false;
         const previous = sources.get(def.key);
-        if (force || !previous || previous.refreshState === 'revalidating') return true;
-        const retryInterval = def.key === 'active' && !previous.sats.length ? 60000 : 5 * 60000;
-        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= retryInterval &&
+        if (force || !previous) return true;
+        if (previous.retryAt) return Date.now() >= previous.retryAt;
+        if (previous.refreshState === 'revalidating') return true;
+        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= 5 * 60000 &&
           (previous.servedStale || previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
       });
       if (!due.length) return;
-      fetching = true; setLoading(due.length);
+      due.forEach(def => inFlight.add(def.key));
+      setLoading(inFlight.size);
       // Load the authoritative active pool first; classification feeds can
       // complete afterwards without holding up the complete satellite display.
       due.sort((a, b) => Number(b.key === 'active') - Number(a.key === 'active'));
@@ -98,14 +115,22 @@ export default function App() {
           if (cancelled) return;
           const previous = sources.get(def.key);
           // A transient failed refresh must not replace an observed catalog with invented objects.
-          if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error };
+          if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error, retryAt: next.retryAt };
           if (previous?.sats.length && (previous.fetchedAt ?? -Infinity) > (next.fetchedAt ?? -Infinity)) {
-            next = { ...previous, servedStale: true, refreshState: next.refreshState ?? 'failed' };
+            next = { ...previous, servedStale: true, refreshState: next.refreshState ?? 'failed', retryAt: next.retryAt };
           }
+          // An empty globe should recover quickly even when no retry time was given.
+          if (def.key === 'active' && !next.sats.length && !next.retryAt) next = { ...next, retryAt: Date.now() + 15000 };
           publish(next);
-        } finally { if (!cancelled) setLoading(count => count - 1); }
+        } finally {
+          inFlight.delete(def.key);
+          if (!cancelled) {
+            setLoading(inFlight.size);
+            scheduleRetry();
+            if (def.key === 'active') scene.loadEarthTexture();
+          }
+        }
       });
-      fetching = false;
     };
     refreshRef.current = () => { void refresh(true); };
     void refresh();
@@ -115,7 +140,7 @@ export default function App() {
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
-      cancelled = true; controller.abort(); clearInterval(interval);
+      cancelled = true; controller.abort(); clearInterval(interval); clearTimeout(retryTimer);
       document.removeEventListener('visibilitychange', onVisible);
       scene.dispose(); engine.current = null; groupsRef.current = [];
     };
@@ -185,7 +210,7 @@ export default function App() {
       <section className="panel overview" aria-label="Satellite explorer">
         <div className="brand-row"><h1><span aria-hidden="true">◉</span> Earth Orbit</h1><span className={`badge ${isLiveTime ? 'fresh' : 'playback'}`}>{isLiveTime ? 'Live time' : paused ? 'Paused' : 'Playback'}</span></div>
         <p className="intro">Explore the objects moving around our planet.</p>
-        <div className="catalog-summary" aria-live="polite">{!allSats.length && loading > 0 ? 'Loading satellite catalog…' : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
+        <div className="catalog-summary" aria-live="polite">{!allSats.length ? (loading > 0 ? 'Loading satellite catalog…' : 'Satellite data unavailable; retrying…') : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
         {allSats.length > 0 && groups.some(g => g.catalogSnapshot) && <p className="muted" role="status">Showing a saved catalog from {utc(groups.find(g => g.catalogSnapshot)!.fetchedAt!)}. {loading ? 'Checking for updates…' : 'Live updates will resume when available.'}</p>}
         <div className="search-wrap"><label className="sr-only" htmlFor="satellite-search">Search satellites by name or catalog ID</label>
           <input id="satellite-search" ref={search} type="search" autoComplete="off" placeholder="Search name or catalog ID…" value={query}

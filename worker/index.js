@@ -1,4 +1,4 @@
-import { fetchOmm, fetchTle, errorResponse } from './proxy.js';
+import { fetchOmm, fetchTle, errorResponse, refreshStoredCatalogs } from './proxy.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -13,5 +13,9 @@ export default {
     }
     if (url.pathname.startsWith('/api/')) return errorResponse('Unknown API endpoint', 404);
     return env.ASSETS.fetch(request);
+  },
+  // Awaited rather than passed to waitUntil, whose time limit is too short for every group.
+  async scheduled(_event, env) {
+    await refreshStoredCatalogs(env);
   },
 };

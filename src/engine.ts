@@ -49,6 +49,7 @@ export interface SatSelection {
 }
 
 export interface Engine {
+  loadEarthTexture(): void;
   setGroups(groups: LoadedGroup[]): void;
   setGroupVisible(key: string, visible: boolean): void;
   setSpeed(multiplier: number): void;
@@ -187,22 +188,26 @@ export function createEngine(
   const earth = new THREE.Mesh(earthGeo, earthMat);
   scene.add(earth);
 
-  // Try loading a real Blue Marble texture from CDN
-  const remoteEarthTexture = new THREE.TextureLoader().load(
-    "https://unpkg.com/three-globe@2.31.0/example/img/earth-blue-marble.jpg",
-    (tex) => {
-      if (disposed) return;
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-      earthMat.map = tex;
-      earthMat.needsUpdate = true;
-      fallbackEarthTexture.dispose();
-      earthTextures.delete(fallbackEarthTexture);
-    },
-    undefined,
-    () => {/* keep procedural texture */}
-  );
-  earthTextures.add(remoteEarthTexture);
+  // Try loading a real Blue Marble texture from CDN, once the catalog is settled
+  let earthTextureRequested = false;
+  function loadEarthTexture() {
+    if (earthTextureRequested || disposed) return;
+    earthTextureRequested = true;
+    earthTextures.add(new THREE.TextureLoader().load(
+      "https://unpkg.com/three-globe@2.31.0/example/img/earth-blue-marble.jpg",
+      (tex) => {
+        if (disposed) return;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        earthMat.map = tex;
+        earthMat.needsUpdate = true;
+        fallbackEarthTexture.dispose();
+        earthTextures.delete(fallbackEarthTexture);
+      },
+      undefined,
+      () => {/* keep procedural texture */}
+    ));
+  }
 
   // Atmosphere glow (backside shell)
   const atmMat = new THREE.ShaderMaterial({
@@ -670,6 +675,7 @@ export function createEngine(
   window.addEventListener("resize", onResize);
 
   return {
+    loadEarthTexture,
     setGroups,
     setGroupVisible(key, visible) {
       const g = groupRenders.find((r) => r.key === key);

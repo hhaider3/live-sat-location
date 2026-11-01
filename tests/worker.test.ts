@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import worker from '../worker/index.js';
-import { fetchOmm, fetchTle, STALE_TTL_SECONDS } from '../worker/proxy.js';
+import { fetchOmm, fetchTle, refreshStoredCatalogs, STALE_TTL_SECONDS } from '../worker/proxy.js';
 import { issOmm, tle, ommCsv } from './fixtures';
 import { fetchMirrorSnapshot } from '../worker/snapshot.js';
 import { ACTIVE_SOURCE, MIRROR_STATUS, MIRROR_SOURCE, SNAPSHOT_PATH } from '../shared/snapshot';
@@ -20,6 +20,23 @@ function setup(t: Parameters<Parameters<typeof test>[1]>[0]) {
   return { store, ctx, flush: () => Promise.all(pending) };
 }
 const url = new URL('https://orbit.test/api/omm?group=stations');
+
+function storedCatalogs(seed: Record<string, { value: string; metadata: Record<string, unknown> }> = {}) {
+  const data = new Map(Object.entries(seed));
+  return { data, puts: [] as string[],
+    async getWithMetadata(key: string) {
+      const entry = data.get(key);
+      return entry ? { value: new Response(entry.value).body, metadata: entry.metadata } : { value: null, metadata: null };
+    },
+    async put(key: string, value: string, options: { metadata: Record<string, unknown> }) {
+      this.puts.push(key); data.set(key, { value, metadata: options.metadata });
+    },
+    async list({ prefix }: { prefix: string }) {
+      return { keys: [...data].filter(([name]) => name.startsWith(prefix)).map(([name, entry]) => ({ name, metadata: entry.metadata })) };
+    } };
+}
+const stored = (fetchedAt: string, records: unknown[] = [issOmm]) =>
+  ({ value: JSON.stringify(records), metadata: { fetchedAt, count: records.length, rejected: 0 } });
 
 test('compact CSV upstream preserves new catalog IDs and serves the compatible JSON API', async t => {
   const { store, ctx, flush } = setup(t);
@@ -242,4 +259,83 @@ test('a mirror publication mismatch is rejected without accepting a new fetch ti
       last_success: new Date().toISOString(), sha256: '0'.repeat(64) })
     : Response.json([issOmm]));
   await assert.rejects(fetchMirrorSnapshot(AbortSignal.timeout(1000)), /digest mismatch/);
+});
+
+test('a cold region answers from the stored catalog without contacting upstream', async t => {
+  const { store, ctx } = setup(t);
+  const activeUrl = new URL('https://orbit.test/api/omm?group=active');
+  const fetchedAt = new Date(Date.now() - 600000).toISOString();
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not reach upstream'); });
+  const env = { CATALOG: storedCatalogs({ 'omm:active': stored(fetchedAt) }),
+    ASSETS: { fetch: async () => { throw new Error('must not parse the snapshot'); } } };
+  const response = await fetchOmm(activeUrl, ctx, env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('X-Fetched-At'), fetchedAt);
+  assert.equal(response.headers.get('X-Served-Stale'), '0');
+  assert.deepEqual(await response.json(), [issOmm]);
+  assert.equal(store.get(activeUrl.href)!.headers.get('X-Fetched-At'), fetchedAt);
+});
+
+test('an older stored catalog cannot replace a newer edge copy, and a stale one still answers at once', async t => {
+  const { store, ctx } = setup(t);
+  const edgeAt = new Date(Date.now() - 3 * 3600000).toISOString();
+  const storedAt = new Date(Date.now() - 5 * 3600000).toISOString();
+  store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: { 'X-Fetched-At': edgeAt } }));
+  let finish!: (response: Response) => void;
+  t.mock.method(globalThis, 'fetch', async () => new Promise<Response>(resolve => { finish = resolve; }));
+  const env = { CATALOG: storedCatalogs({ 'omm:stations': stored(storedAt, []) }) };
+  const newerEdge = await fetchOmm(url, ctx, env);
+  assert.equal(newerEdge.headers.get('X-Fetched-At'), edgeAt);
+  finish?.(new Response('unavailable', { status: 500 }));
+  store.delete(url.href);
+  store.delete(`${url}&refresh-state=1`);
+  const staleStored = await fetchOmm(url, ctx, env);
+  assert.equal(staleStored.headers.get('X-Fetched-At'), storedAt);
+  assert.equal(staleStored.headers.get('X-Served-Stale'), '1');
+});
+
+test('a visitor arriving during a cold refresh is told to retry within seconds', async t => {
+  const { ctx } = setup(t);
+  const activeUrl = new URL('https://orbit.test/api/omm?group=active');
+  t.mock.method(globalThis, 'fetch', async () => new Promise<Response>(() => {}));
+  void fetchOmm(activeUrl, ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  const second = await fetchOmm(activeUrl, ctx);
+  assert.equal(second.status, 503);
+  assert.equal(second.headers.get('Retry-After'), '5');
+});
+
+test('the scheduled refresh stores every requested group and keeps going past a failure', async t => {
+  const activeRecords = Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
+  const fetchedAt = new Date(Date.now() - 3 * 3600000).toISOString();
+  const CATALOG = storedCatalogs({ 'omm:gps-ops': stored(fetchedAt) });
+  t.mock.method(globalThis, 'fetch', async (input: URL) => {
+    const group = input.searchParams.get('GROUP');
+    if (group === 'gps-ops') return new Response('rate limited', { status: 429 });
+    return new Response(ommCsv(group === 'active' ? activeRecords : [issOmm]));
+  });
+  await assert.rejects(worker.scheduled({}, { CATALOG }), /gps-ops: http-429/);
+  assert.equal(CATALOG.puts.length, 8);
+  assert.equal(CATALOG.data.get('omm:gps-ops')!.metadata.fetchedAt, fetchedAt);
+  assert.equal(CATALOG.data.get('omm:active')!.metadata.count, 10000);
+  assert.equal(JSON.parse(CATALOG.data.get('omm:stations')!.value)[0].NORAD_CAT_ID, 25544);
+});
+
+test('the scheduled refresh rejects a shrunken active feed and falls back to the verified mirror', async t => {
+  const records = Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
+  const body = JSON.stringify(records);
+  const mirrored = new Date(Date.now() - 60000).toISOString();
+  const previous = new Date(Date.now() - 3 * 3600000).toISOString();
+  const CATALOG = storedCatalogs({ 'omm:active': { value: '[]', metadata: { fetchedAt: previous, count: 20000, rejected: 0 } } });
+  t.mock.method(console, 'warn', () => {});
+  t.mock.method(globalThis, 'fetch', async (input: URL | string) => {
+    if (String(input) === MIRROR_STATUS) return Response.json({ dataset: 'active', query: 'GROUP', value: 'active',
+      last_success: mirrored, record_count: records.length, sha256: createHash('sha256').update(body).digest('hex') });
+    if (String(input) === MIRROR_SOURCE) return new Response(body);
+    return new Response(ommCsv((input as URL).searchParams.get('GROUP') === 'active' ? records : [issOmm]));
+  });
+  await refreshStoredCatalogs({ CATALOG });
+  const saved = CATALOG.data.get('omm:active')!;
+  assert.equal(saved.metadata.fetchedAt, mirrored);
+  assert.equal(saved.metadata.source, MIRROR_SOURCE);
 });

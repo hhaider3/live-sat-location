@@ -2,6 +2,9 @@ name: Check
 on:
   push:
   pull_request:
+  # The startup catalog has a time limit, which can pass without any new commits.
+  schedule:
+    - cron: '41 6 * * 1'
 jobs:
   verify:
     runs-on: ubuntu-latest
