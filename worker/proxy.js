@@ -7,10 +7,10 @@ export const CACHE_TTL_SECONDS = 2 * 60 * 60;
 export const STALE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const ALLOWED_GROUPS = new Set([
   'starlink', 'oneweb', 'gps-ops', 'glo-ops', 'galileo', 'beidou',
-  'iridium-NEXT', 'stations', 'geo', 'science', 'kuiper', 'active',
+  'iridium-NEXT', 'stations', 'weather', 'geo', 'science', 'kuiper', 'active',
 ]);
 // The groups the frontend requests. Named constellations come from the active feed.
-const STORED_GROUPS = ['active', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'iridium-NEXT', 'stations', 'geo', 'science'];
+const STORED_GROUPS = ['active', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'iridium-NEXT', 'stations', 'weather', 'geo', 'science'];
 const MIN_ACTIVE_RECORDS = 10000;
 
 export function errorResponse(message, status, extraHeaders = {}) {
@@ -225,6 +225,8 @@ async function refreshStoredGroup(env, group, previous) {
   } catch (error) {
     if (group !== 'active') throw error;
     const snapshot = await fetchMirrorSnapshot(AbortSignal.timeout(30000));
+    // The mirror's digest comes from the same host, so it proves integrity, not authenticity.
+    if (previous?.count && snapshot.records.length < previous.count * 0.8) throw error;
     if (Date.parse(snapshot.fetchedAt) > Date.parse(previous?.fetchedAt ?? '') || !previous?.fetchedAt) {
       await writeStored(env, group, snapshot.records, { fetchedAt: snapshot.fetchedAt,
         count: snapshot.records.length, rejected: 0, source: snapshot.source });

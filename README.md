@@ -17,14 +17,14 @@ Rendering and orbit propagation run in the browser. A small Cloudflare Worker do
 - Selected orbit path and Earth-fixed ground track over the next orbit
 - Optional equator and altitude reference rings for LEO, GPS, and GEO
 - Satellite point size/brightness controls and a background-star toggle
-- Independent playback status and Fresh / Stale / Simulated data indicators
+- Independent playback status and Fresh / Stale data indicators
 - Element epoch and last successful fetch on the selected satellite
 - Pause, reverse, logarithmic speed presets, local date entry, and an atomic return to live time
 - Geometric pass predictions above 10° elevation over the next 24 hours for preset cities or custom coordinates
 - Responsive panels, keyboard-accessible search, labeled controls, and visible focus indicators
 - Background Web Workers for synchronized catalog propagation and pass calculations
 - Incremental group updates that preserve existing scene objects and selection
-- Single-file application build, including inline Web Workers
+- Single-file application build, including inline Web Workers, with a hash-based Content Security Policy
 
 ## Controls
 
@@ -73,7 +73,8 @@ npm run check       # TypeScript, focused tests, production build
 npm audit           # dependency advisories
 npm run build       # produces dist/index.html
 npm run snapshot:update # refresh the site-hosted startup catalog
-npm run deploy      # refresh snapshot, build and deploy Worker + assets
+npm run test:e2e    # real-browser tests (first run: npx playwright install chromium)
+npm run deploy      # build, refresh the built snapshot, deploy Worker + assets
 ```
 
 For repeatable UI checks without CelesTrak, run `node scripts/preview-fixtures.mjs` in place of the Worker, then start Vite. This local-only API serves explicitly named test objects and unavailable groups. It is never bundled into the app. To check first-visit fallback, open the static preview on an unused port: it has no working API and must still display the saved catalog.
@@ -92,9 +93,9 @@ Amazon Leo is displayed as **Amazon Leo (Kuiper)** and uses the `KUIPER-` names 
 
 `GET /api/omm?group=stations` requests a supported group. The proxy requests `FORMAT=CSV`, validates and converts records, and caches a JSON response for two hours. CSV carries the same OMM fields and extended IDs with much less transfer overhead than JSON. Quoted fields, column order and CRLF are supported; malformed or truncated rows are rejected. Older cached observations are returned immediately while `ctx.waitUntil` refreshes them in the background. Retention is bounded at 30 days, subject to Cloudflare cache eviction; this is best-effort storage. Invalid responses never replace a good cached copy. Small cold upstream requests time out after 10 seconds; their background refreshes get 25 seconds without delaying the response. `/api/tle` remains a compatibility fallback for smaller groups, but the client respects `Retry-After` instead of making a second request to an unavailable provider.
 
-A Cron Trigger (`17 */2 * * *`) downloads every requested group and stores it in the `CATALOG` KV namespace, so visitors and cold regions do not wait for upstream. A failed group keeps its last good copy, and the run is reported as failed in Cloudflare's Cron Events. A region with an empty edge cache reads the stored catalog first, then the deployed `public/data/active.json` asset, including during an upstream cooldown. If CelesTrak cannot refresh the active feed, the Worker tries the [Orbit Data mirror](https://github.com/Darkflib/orbit-data), checks its published SHA-256 digest and record count, validates every record, and preserves its original `last_success` timestamp. The mirror and snapshot are independently rejected after 30 days. Successful refreshes replace saved data; a shrunken active feed does not.
+A Cron Trigger (`17 */2 * * *`) downloads every requested group and stores it in the `CATALOG` KV namespace, so visitors and cold regions do not wait for upstream. A failed group keeps its last good copy, and the run is reported as failed in Cloudflare's Cron Events. A region with an empty edge cache reads the stored catalog first, then the deployed `public/data/active.json` asset, including during an upstream cooldown. If CelesTrak cannot refresh the active feed, the Worker tries the [Orbit Data mirror](https://github.com/Darkflib/orbit-data), checks its published SHA-256 digest and record count, validates every record, and preserves its original `last_success` timestamp. The digest comes from the same host, so it detects corruption rather than proving origin; the Worker therefore also refuses a mirror copy that shrinks the stored catalog. The mirror and snapshot are independently rejected after 30 days. Successful refreshes replace saved data; a shrunken active feed does not.
 
-`npm run snapshot:update` refreshes the checked-in startup asset from CelesTrak or the verified mirror using an atomic replacement. It rejects incomplete catalogs, duplicate IDs, and unexpected count drops. Deployment runs this step automatically and can retain an existing valid snapshot if both providers fail; normal builds do not use the network. The snapshot is now a backstop for the stored catalog, but it still expires after 30 days. A test fails once fewer than seven days remain, and CI also runs weekly so this surfaces without a new commit.
+`npm run deploy` refreshes the built snapshot from CelesTrak or the verified mirror, leaving the tracked `public/data/active.json` untouched, and can retain the existing copy if both providers fail. `npm run snapshot:update` refreshes the tracked copy for offline development; both reject incomplete catalogs, duplicate IDs, and unexpected count drops, and normal builds and tests do not use the network. The snapshot is now a backstop for the stored catalog, but the deployed copy still expires 30 days after a deploy. A weekly CI job (`scripts/check-live.mjs`) fails when it has fewer than seven days left, or when the live active catalog is more than 12 hours old.
 
 Refresh state is cached separately: timeouts and server errors back off for 15 minutes, and HTTP 403/429 responses for two hours. `X-Refresh-State` distinguishes an ongoing background refresh from a failed one. The original `X-Fetched-At` never changes on failure. The browser also retains validated OMM responses for up to 30 days and renders them before a new request finishes; storage is optional and synthetic data is never saved.
 
@@ -103,23 +104,22 @@ Responses preserve `X-Fetched-At`, indicate stale fallback through `X-Served-Sta
 - **Fresh elements:** element epoch within 3.5 days of wall-clock time.
 - **Stale elements:** element epoch outside that range.
 - **Mixed elements:** a group contains both fresh and stale elements. The header counts individual satellites, not groups.
-- **Simulated:** a synthetic circular constellation, not observed satellite positions.
 
 Delivery status is separate: recent fetch, refresh due, failed refresh using cached observations, or unknown fetch time. Missing legacy HTTP metadata does not mean the elements themselves are stale. Both endpoints refresh after two hours and retain outage fallbacks for up to 30 days. Legacy entries without fetch timestamps use Last-Modified only to bound retention, never to invent a fetch time. `X-Upstream-Error` distinguishes timeout, HTTP failure, and invalid data when a refresh fails.
 
-These freshness thresholds are display heuristics, not accuracy guarantees. A separate notice appears when the displayed simulation time is more than 3.5 days from a selected object's epoch. Live time only describes playback. A simulated object's selection and pass panels always identify it as simulated.
+These freshness thresholds are display heuristics, not accuracy guarantees. A separate notice appears when the displayed simulation time is more than 3.5 days from a selected object's epoch. Live time only describes playback.
 
-Fresh groups become due after two hours. While visible, the client checks pending background refreshes every 30 seconds and failed/expired groups at most every five minutes; the Worker enforces the longer upstream cooldown. Manual refresh still respects that cooldown. If a refresh fails, an already loaded observed group is retained with a failed-refresh notice instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
+Fresh groups become due after two hours. While visible, the client checks pending background refreshes at most once a minute and failed/expired groups at most every five minutes; the Worker enforces the longer upstream cooldown. Manual refresh still respects that cooldown. If a refresh fails, an already loaded observed group is retained with a failed-refresh notice instead of being replaced by synthetic objects. Selection is preserved by group and catalog ID when data changes.
 
 OMM avoids the legacy TLE catalog-number limit. See [CelesTrak's GP formats documentation](https://celestrak.org/NORAD/documentation/gp-data-formats.php) and [satellite.js](https://github.com/shashwatak/satellite-js).
 
 ## Simulation model
 
-All visible groups are propagated in a Web Worker at the same pair of timestamps. Complete snapshots are published together, and the renderer uses one interpolation fraction for the entire catalog. Snapshot intervals are capped at 30 simulated seconds to limit straight-line interpolation error. At extreme playback speeds the view skips ahead between snapshots rather than interpolating across long orbital arcs. Displayed time, Earth rotation, and selected-object details follow the rendered snapshot. The simulation clock uses wall-clock anchors to avoid cumulative frame drift and recover after backgrounding. A synchronous snapshot fallback is available if Web Workers cannot start.
+All visible groups are propagated in a Web Worker at the same pair of timestamps. Complete snapshots are published together, and the renderer uses one interpolation fraction for the entire catalog. A snapshot covers its whole span, so at 1× the catalog is recalculated about once a second rather than continuously, with a margin that grows on slower devices. Snapshot intervals are capped at 30 simulated seconds to limit straight-line interpolation error. At extreme playback speeds the view skips ahead between snapshots rather than interpolating across long orbital arcs. Displayed time, Earth rotation, and selected-object details follow the rendered snapshot. The simulation clock uses wall-clock anchors to avoid cumulative frame drift and recover after backgrounding. A synchronous snapshot fallback is available if Web Workers cannot start.
 
-The Earth is rendered as a mean-radius sphere; latitude, longitude, and altitude use satellite.js's geodetic conversion. Guide rings illustrate equatorial radii, not orbital boundaries in every direction. The selected ground track projects future positions onto the rotating globe. The blue-marble texture is loaded from a CDN, with a procedural fallback if unavailable.
+The Earth is rendered as a mean-radius sphere; latitude, longitude, and altitude use satellite.js's geodetic conversion. Guide rings illustrate equatorial radii, not orbital boundaries in every direction. The selected ground track projects future positions onto the rotating globe. The NASA Blue Marble texture (as distributed with [three-globe](https://github.com/vasturiano/three-globe), MIT) is hosted with the site and loads after the catalog, with a procedural texture until then.
 
-Pass predictions scan the next 24 hours at 10-second intervals, refine threshold crossings to about half a second, and report peak elevation at the sampling resolution. They assume a sea-level observer and a 10° minimum elevation. Daylight, clouds, terrain, and satellite illumination are not modeled; a geometric pass is not a promise of naked-eye visibility. Predictions are calculated on demand from the displayed time and must be recalculated after changing it. Simulated pass predictions are illustrative only.
+Pass predictions scan the next 24 hours at 10-second intervals, refine threshold crossings to about half a second, and report peak elevation at the sampling resolution. They assume a sea-level observer and a 10° minimum elevation. Daylight, clouds, terrain, and satellite illumination are not modeled; a geometric pass is not a promise of naked-eye visibility. Predictions are calculated on demand from the displayed time and must be recalculated after changing it.
 
 This project is for visualization and education. Do not use it for navigation, conjunction assessment, or spacecraft operations.
 
@@ -130,7 +130,7 @@ src/
   App.tsx                 Interface, search, data lifecycle, and playback controls
   PassPlanner.tsx         City/coordinate input and pass results
   engine.ts               Three.js rendering, selection, tracking, and overlays
-  satellites.ts           OMM ingestion, freshness, propagation, and synthetic groups
+  satellites.ts           OMM ingestion, freshness, and propagation
   propagation.ts          Timestamped snapshots and interpolation
   propagation.worker.ts   Background catalog propagation
   catalog.worker.ts       Background catalog parsing
@@ -148,5 +148,7 @@ worker/store.js           Scheduled catalog copies in Workers KV
 public/data/active.json   Observed startup catalog with original fetch date
 scripts/update-snapshot.mjs Atomic startup catalog update
 scripts/test.mjs          Isolated test build and runner
+scripts/check-live.mjs    Scheduled check of the live site's catalog ages
 tests/                   Orbital, playback, and proxy regression tests
+e2e/                     Real-browser tests of the built app
 ```

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { twoline2satrec, propagate, eciToEcf, ecfToLookAngles } from 'satellite.js';
 import { validOmm, epochMillis } from '../shared/omm';
 import { parseOmm, dataFreshness, deliveryStatus, loadGroup, GROUP_DEFS, eciPosition, eciState, gmst, geographicPosition, sampleGroundTrack, type LoadedGroup, type Sat } from '../src/satellites';
-import { buildSnapshot, interpolatePositions, snapshotTime, HIDDEN_POSITION } from '../src/propagation';
+import { buildSnapshot, carryPositions, interpolatePositions, snapshotInterval, snapshotStep, snapshotTime, HIDDEN_POSITION } from '../src/propagation';
 import { predictPasses } from '../src/passes';
 import { SimulationClock, formatSpeed } from '../src/time';
 import { issOmm, tle } from './fixtures';
@@ -50,11 +50,11 @@ test('element freshness is independent of transport age and missing legacy metad
   assert.match(deliveryStatus({ ...fixtureGroup(), servedStale: true }, epoch), /Refresh failed/);
   assert.match(deliveryStatus({ ...fixtureGroup(), fetchedAt: null }, epoch), /fetch time unknown/);
   assert.equal(dataFreshness({ ...fixtureGroup(), fetchedAt: epoch + 5 * 86400000 }, epoch + 5 * 86400000), 'Stale');
-  assert.equal(dataFreshness({ ...fixtureGroup(), sats: GROUP_DEFS[7].fallback() }, epoch), 'Simulated');
+  assert.equal(dataFreshness({ ...fixtureGroup(), sats: [] }, epoch), 'Unavailable');
 });
 
 test('one old satellite does not label an entire observed group stale', () => {
-  assert.equal(real.kind, 'sgp4');
+  assert.ok(real.satrec);
   const old = { ...real, epochMs: epoch - 5 * 86400000 } as Sat;
   const group = { ...fixtureGroup(), sats: [real, old] };
   assert.equal(dataFreshness(group, epoch), 'Mixed');
@@ -77,7 +77,7 @@ test('OMM timeout leaves a full independent timeout for the TLE fallback', async
   const pending = loadGroup(GROUP_DEFS[7]);
   await ready; t.mock.timers.tick(15001);
   const result = await pending;
-  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.ok(result.sats[0].satrec);
   assert.equal(result.fetchedAt, null);
   assert.equal(dataFreshness(result, epoch), 'Fresh');
 });
@@ -90,7 +90,7 @@ test('client preserves stale/fetch headers and falls back on invalid JSON', asyn
   assert.equal(result.fetchedAt, epoch); assert.equal(result.servedStale, true); assert.equal(result.rejectedCount, 2);
   t.mock.restoreAll();
   t.mock.method(globalThis, 'fetch', async () => new Response('<html>outage</html>'));
-  assert.equal(dataFreshness(await loadGroup(GROUP_DEFS[7])), 'Simulated');
+  assert.equal(dataFreshness(await loadGroup(GROUP_DEFS[7])), 'Unavailable');
 });
 
 test('client falls back to a previous Worker TLE route when the OMM route is unavailable', async t => {
@@ -109,7 +109,7 @@ test('client falls back to a previous Worker TLE route when the OMM route is una
   assert.deepEqual(requests.map(url => url.includes('/api/omm') ? 'omm' : 'tle'), ['omm', 'tle']);
 });
 
-test('unmounted client requests abort rather than publishing synthetic fallback', async t => {
+test('unmounted client requests abort rather than publishing an empty group', async t => {
   const ctrl = new AbortController(); ctrl.abort();
   t.mock.method(globalThis, 'fetch', async (_url, options) => { options.signal.throwIfAborted(); return new Response(); });
   await assert.rejects(loadGroup(GROUP_DEFS[7], ctrl.signal));
@@ -132,11 +132,11 @@ test('saved OMM appears before the network finishes and survives an upstream coo
   let displayed: LoadedGroup | undefined;
   const loading = loadGroup(GROUP_DEFS[7], undefined, group => { displayed = group; });
   await ready;
-  assert.equal(displayed?.sats[0].kind, 'sgp4');
+  assert.ok(displayed?.sats[0].satrec);
   assert.match(deliveryStatus(displayed!), /refreshing in background/);
   finish(new Response('unavailable', { status: 503, headers: { 'Retry-After': '900' } }));
   const result = await loading;
-  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.ok(result.sats[0].satrec);
   assert.equal(result.fetchedAt, Date.parse(fetched));
   assert.equal(result.refreshState, 'failed');
   assert.equal(calls, 1, 'must not ask the same unavailable provider for TLE too');
@@ -152,13 +152,13 @@ test('client tolerates denied browser storage and preserves background refresh s
     'X-Fetched-At': new Date(epoch).toISOString(), 'X-Served-Stale': '1', 'X-Refresh-State': 'revalidating',
   } }));
   const result = await loadGroup(GROUP_DEFS[7], undefined, () => assert.fail('no saved response'));
-  assert.equal(result.sats[0].kind, 'sgp4');
+  assert.ok(result.sats[0].satrec);
   assert.equal(result.fetchedAt, epoch);
   assert.match(deliveryStatus(result), /refreshing in background/);
 });
 
 test('every group shares a timestamp, including reverse snapshots and failed positions', () => {
-  const sats = GROUP_DEFS[7].fallback();
+  const sats = [real];
   const groups = new Map([['a', sats], ['b', sats]]);
   const shot = buildSnapshot(groups, { type: 'sample', keys: ['a', 'b'], generation: 8, start: epoch, end: epoch - 10000 });
   assert.deepEqual(shot.groups[0].a, shot.groups[1].a);
@@ -169,7 +169,7 @@ test('every group shares a timestamp, including reverse snapshots and failed pos
   interpolatePositions(shot.groups[0].a, shot.groups[0].b, 0.5, out);
   const p = eciPosition(sats[0], new Date(epoch - 5000))!;
   assert.ok(Math.hypot(out[0] - p.x / 1000, out[1] - p.z / 1000, out[2] + p.y / 1000) < 0.001);
-  const failed = { ...real, satrec: { ...(real as Extract<Sat, { kind: 'sgp4' }>).satrec, ecco: 1.5 } } as Sat;
+  const failed = { ...real, satrec: { ...real.satrec, ecco: 1.5 } };
   assert.equal(eciPosition(failed, new Date(epoch)), null);
   assert.equal(eciState(failed, new Date(epoch)), null);
   const failShot = buildSnapshot(new Map([['bad', [failed]]]), { type: 'sample', keys: ['bad'], generation: 0, start: epoch, end: epoch });
@@ -212,4 +212,28 @@ test('return to live atomically resets reverse, pause, speed, and date; wall-clo
   now += 3600000; assert.equal(clock.time(), now);
   clock.setTime(NaN); assert.equal(clock.time(), now);
   assert.equal(formatSpeed(Math.pow(10, Math.log10(86400))), '1.0 d/s');
+});
+
+test('snapshots are requested just before they run out, not continuously', () => {
+  assert.equal(snapshotInterval(1, 30), 890, 'one second of data at 1x, less the latency margin');
+  assert.equal(snapshotInterval(-1, 30), 890, 'reverse playback uses the same schedule');
+  assert.equal(snapshotInterval(1, 200), 550, 'a slower device requests earlier so positions never stall');
+  assert.equal(snapshotInterval(1, 5000), 100, 'an overloaded device keeps the responsive minimum');
+  for (const speed of [1, 2, 10, 60, 600, 3600, 86400]) {
+    const span = Math.abs(snapshotStep(speed)) / speed;
+    const interval = snapshotInterval(speed, 30);
+    if (span > 100) assert.ok(interval < span || interval === 100, `speed ${speed} must overlap its snapshot`);
+    assert.ok(interval >= Math.max(16, Math.min(100, 10000 / speed)), `speed ${speed} must not sample faster than before`);
+  }
+  assert.equal(snapshotStep(-60), -7200);
+  assert.equal(snapshotStep(86400), 30000);
+});
+
+test('a rebuilt group keeps drawn positions and only hides satellites it has never drawn', () => {
+  const other = { ...real, id: 'other' };
+  const unseen = { ...real, id: 'unseen' };
+  const drawn = [{ sats: [real], positions: new Float32Array([1, 2, 3]) }, { sats: [other], positions: new Float32Array([4, 5, 6]) }];
+  const out = new Float32Array(9).fill(HIDDEN_POSITION);
+  carryPositions([other, unseen, real], drawn, out);
+  assert.deepEqual([...out], [4, 5, 6, HIDDEN_POSITION, HIDDEN_POSITION, HIDDEN_POSITION, 1, 2, 3]);
 });

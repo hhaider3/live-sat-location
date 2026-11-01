@@ -34,7 +34,6 @@ export default function PassPlanner({ sat, getTime, onJump }: { sat: Sat; getTim
   return <details className="pass-planner">
     <summary>Upcoming passes</summary>
     <p className="muted">Next 24 hours from the displayed time, above 10° elevation. Geometric passes; visibility in the night sky is not predicted.</p>
-    {sat.kind === 'kepler' && <p className="notice">Illustrative passes for a simulated object.</p>}
     <label>Observer city<select value={city} onChange={e => {
       clear(); setCity(e.target.value); const match = CITIES.find(c => c.name === e.target.value);
       if (match) { setLat(String(match.latitude)); setLon(String(match.longitude)); }
