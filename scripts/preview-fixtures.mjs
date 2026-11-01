@@ -5,12 +5,15 @@ const bundled = await build({ entryPoints: ['tests/fixtures.ts'], bundle: true, 
 const { issOmm } = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
 const now = Date.now();
 const current = { ...issOmm, EPOCH: new Date(now).toISOString(), OBJECT_NAME: 'ISS (test fixture)' };
-const groups = ['starlink', 'oneweb', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'iridium-NEXT', 'stations', 'geo', 'kuiper', 'active'];
+const groups = ['starlink', 'oneweb', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'iridium-NEXT', 'stations', 'weather', 'geo', 'kuiper', 'active'];
+// The app classifies these from their names in the active feed.
+const namedPrefix = { starlink: 'STARLINK', oneweb: 'ONEWEB', kuiper: 'KUIPER' };
 const calls = new Map();
 function recordsFor(group) {
   const count = group === 'starlink' ? 12000 : group === 'kuiper' ? 250 : 1;
   return Array.from({ length: count }, (_, i) => ({ ...current,
-    OBJECT_NAME: group === 'stations' ? current.OBJECT_NAME : `TEST ${group.toUpperCase()} ${i + 1}`,
+    OBJECT_NAME: group === 'stations' ? current.OBJECT_NAME
+      : namedPrefix[group] ? `${namedPrefix[group]}-${i + 1}` : `TEST ${group.toUpperCase()} ${i + 1}`,
     NORAD_CAT_ID: group === 'stations' ? 25544 : group === 'gps-ops' ? 100608 : 200000 + groups.indexOf(group) * 20000 + i,
     MEAN_MOTION: ['geo', 'gps-ops'].includes(group) ? (group === 'geo' ? 1.0027 : 2.0056) : current.MEAN_MOTION,
     MEAN_ANOMALY: (current.MEAN_ANOMALY + i * 0.23) % 360,
@@ -31,5 +34,5 @@ createServer((req, res) => {
       'X-Fetched-At': fetchedAt, 'X-Served-Stale': stale ? '1' : '0',
       'X-Refresh-State': stale ? 'revalidating' : 'ready' });
     res.end(JSON.stringify(records));
-  }, group === 'starlink' && n <= 2 ? 6000 : 0);
+  }, group === 'geo' && n <= 2 ? 6000 : 0); // a membership feed arriving after the catalog
 }).listen(8787, '127.0.0.1', () => console.log('TEST FIXTURES ONLY — API on http://127.0.0.1:8787; run npm run dev for the app.'));

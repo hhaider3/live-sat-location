@@ -4,7 +4,7 @@ import { dataFreshness, deliveryStatus, ELEMENT_AGE_LIMIT_MS, GROUP_DEFS, loadGr
 import { parseCatalogInWorker } from './catalogParser';
 import { formatSpeed } from './time';
 import PassPlanner from './PassPlanner';
-import { activeCatalog, CATALOG_REQUESTS, loadInBatches } from './catalog';
+import { activeCatalog, CATALOG_REQUESTS, isRefreshDue, loadInBatches } from './catalog';
 
 setCatalogParser(parseCatalogInWorker);
 
@@ -19,7 +19,7 @@ const localInput = (ms: number) => {
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 function FreshnessBadge({ status }: { status: ReturnType<typeof dataFreshness> }) {
-  return <span className={`badge ${status.toLowerCase()}`}>{status === 'Simulated' || status === 'Unavailable' ? status : `${status} elements`}</span>;
+  return <span className={`badge ${status.toLowerCase()}`}>{status === 'Unavailable' ? status : `${status} elements`}</span>;
 }
 
 export default function App() {
@@ -93,12 +93,7 @@ export default function App() {
       if (cancelled) return;
       const due = CATALOG_REQUESTS.filter(def => {
         if (inFlight.has(def.key)) return false;
-        const previous = sources.get(def.key);
-        if (force || !previous) return true;
-        if (previous.retryAt) return Date.now() >= previous.retryAt;
-        if (previous.refreshState === 'revalidating') return true;
-        return Date.now() - (lastAttempt.get(def.key) ?? 0) >= 5 * 60000 &&
-          (previous.servedStale || previous.fetchedAt === null || Date.now() - previous.fetchedAt >= 2 * 3600000);
+        return isRefreshDue(sources.get(def.key), lastAttempt.get(def.key) ?? 0, Date.now(), force);
       });
       if (!due.length) return;
       due.forEach(def => inFlight.add(def.key));
@@ -110,12 +105,12 @@ export default function App() {
         if (cancelled) return;
         lastAttempt.set(def.key, Date.now());
         try {
-          const hasObserved = sources.get(def.key)?.sats.some(s => s.kind === 'sgp4');
+          const hasObserved = !!sources.get(def.key)?.sats.length;
           let next = await loadGroup(def, controller.signal, hasObserved ? undefined : publish);
           if (cancelled) return;
           const previous = sources.get(def.key);
           // A transient failed refresh must not replace an observed catalog with invented objects.
-          if (next.error && previous?.sats.some(s => s.kind === 'sgp4')) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error, retryAt: next.retryAt };
+          if (next.error && previous?.sats.length) next = { ...previous, servedStale: true, refreshState: 'failed', error: next.error, retryAt: next.retryAt };
           if (previous?.sats.length && (previous.fetchedAt ?? -Infinity) > (next.fetchedAt ?? -Infinity)) {
             next = { ...previous, servedStale: true, refreshState: next.refreshState ?? 'failed', retryAt: next.retryAt };
           }
@@ -172,12 +167,20 @@ export default function App() {
   const selectedSat = selectedGroup?.sats.find(s => s.id === selection?.id);
   const isVisible = (key: string) => visibility[key] ?? true;
   const visibleCount = groups.filter(g => isVisible(g.key)).reduce((sum, g) => sum + g.sats.length, 0);
-  const statuses = groups.flatMap(g => g.sats.map(sat => dataFreshness(g, Date.now(), sat)));
-  const fresh = statuses.filter(s => s === 'Fresh').length;
-  const stale = statuses.filter(s => s === 'Stale').length;
-  const simulated = statuses.filter(s => s === 'Simulated').length;
+  // Labels age slowly, so recount each minute rather than on every 5 Hz clock update.
+  const freshnessMinute = Math.floor(Date.now() / 60000);
+  const { fresh, stale } = useMemo(() => {
+    const now = freshnessMinute * 60000;
+    const counts = { fresh: 0, stale: 0 };
+    for (const g of groups) for (const sat of g.sats) {
+      const status = dataFreshness(g, now, sat);
+      if (status === 'Fresh') counts.fresh++;
+      else if (status === 'Stale') counts.stale++;
+    }
+    return counts;
+  }, [groups, freshnessMinute]);
   const isLiveTime = !paused && !reverse && exp === 0 && Math.abs(simTime - Date.now()) < 5000;
-  const iss = allSats.find(({ sat }) => sat.id === '25544') ?? allSats.find(({ sat }) => sat.kind === 'kepler' && sat.name.startsWith('ISS-'));
+  const iss = useMemo(() => allSats.find(({ sat }) => sat.id === '25544'), [allSats]);
 
   const setVisible = (key: string, visible: boolean) => {
     visibilityRef.current.set(key, visible);
@@ -210,7 +213,7 @@ export default function App() {
       <section className="panel overview" aria-label="Satellite explorer">
         <div className="brand-row"><h1><span aria-hidden="true">◉</span> Earth Orbit</h1><span className={`badge ${isLiveTime ? 'fresh' : 'playback'}`}>{isLiveTime ? 'Live time' : paused ? 'Paused' : 'Playback'}</span></div>
         <p className="intro">Explore the objects moving around our planet.</p>
-        <div className="catalog-summary" aria-live="polite">{!allSats.length ? (loading > 0 ? 'Loading satellite catalog…' : 'Satellite data unavailable; retrying…') : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>{simulated.toLocaleString()} simulated</span><span>satellites</span></>}</div>
+        <div className="catalog-summary" aria-live="polite">{!allSats.length ? (loading > 0 ? 'Loading satellite catalog…' : 'Satellite data unavailable; retrying…') : <><span className="fresh-text">{fresh.toLocaleString()} fresh</span><span className="stale-text">{stale.toLocaleString()} stale</span><span>satellites</span></>}</div>
         {allSats.length > 0 && groups.some(g => g.catalogSnapshot) && <p className="muted" role="status">Showing a saved catalog from {utc(groups.find(g => g.catalogSnapshot)!.fetchedAt!)}. {loading ? 'Checking for updates…' : 'Live updates will resume when available.'}</p>}
         <div className="search-wrap"><label className="sr-only" htmlFor="satellite-search">Search satellites by name or catalog ID</label>
           <input id="satellite-search" ref={search} type="search" autoComplete="off" placeholder="Search name or catalog ID…" value={query}
@@ -229,7 +232,7 @@ export default function App() {
               if (e.key === 'ArrowDown') { e.preventDefault(); resultButtons.current[(index + 1) % results.length]?.focus(); }
               if (e.key === 'ArrowUp') { e.preventDefault(); if (index === 0) search.current?.focus(); else resultButtons.current[index - 1]?.focus(); }
               if (e.key === 'Escape') { e.stopPropagation(); setQuery(''); search.current?.focus(); }
-            }}><span className="result-name">{sat.name}</span><span className="muted">{group.label} · {sat.kind === 'sgp4' ? `#${sat.id}` : 'Simulated'}</span></button>
+            }}><span className="result-name">{sat.name}</span><span className="muted">{group.label} · #{sat.id}</span></button>
           </li>)}</ul>
         </div>}
         <div className="quick-actions"><button className="action" disabled={!iss} onClick={() => iss && selectSat(iss.group, iss.sat)}>Find ISS</button><button className="action" onClick={() => engine.current?.resetView()}>Reset view</button></div>
@@ -238,7 +241,7 @@ export default function App() {
       {selection && selectedSat && selectedGroup && <section className="panel selection-panel" aria-label="Selected satellite">
         <div className="selection-heading"><button className="selection-title" aria-expanded={detailsOpen} aria-controls="satellite-details" onClick={() => setDetailsOpen(o => !o)}><span className="dot" style={{ background: selection.color }} /><h2>{selection.name}</h2><span aria-hidden="true">{detailsOpen ? '▾' : '▸'}</span></button><button className="icon-button" aria-label="Deselect satellite" title="Deselect (Esc)" onClick={() => engine.current?.clearSelection()}>×</button></div>
         {detailsOpen && <div id="satellite-details" className="satellite-details">
-          <div className="selection-subtitle"><span>{selection.label}{selectedSat.kind === 'sgp4' ? ` · #${selection.id}` : ''}</span><FreshnessBadge status={dataFreshness(selectedGroup, Date.now(), selectedSat)} /></div>
+          <div className="selection-subtitle"><span>{selection.label} · #{selection.id}</span><FreshnessBadge status={dataFreshness(selectedGroup, Date.now(), selectedSat)} /></div>
           <dl className="metrics">
             <div><dt>Altitude</dt><dd>{value(selection.altitudeKm)} <small>km</small></dd></div>
             <div><dt>Velocity</dt><dd>{value(selection.velocityKmS, 2)} <small>km/s</small></dd></div>
@@ -249,8 +252,8 @@ export default function App() {
           </dl>
           {!Number.isFinite(selection.altitudeKm) && <p className="notice">Position unavailable at this time. Try a time closer to the element epoch.</p>}
           <div className="quick-actions"><button className={`action ${selection.following ? 'active' : ''}`} aria-pressed={selection.following} onClick={() => engine.current?.setFollowing(!selection.following)}>{selection.following ? 'Stop following' : 'Follow satellite'}</button><button className="action" onClick={() => isolate(selection.key)}>Isolate group</button></div>
-          {selectedSat.kind === 'sgp4' ? <div className="data-detail"><p>Element epoch <time>{utc(selectedSat.epochMs)}</time></p><p>Last successful fetch <time>{selectedGroup.fetchedAt === null ? 'Unknown' : utc(selectedGroup.fetchedAt)}</time></p><p>{deliveryStatus(selectedGroup)}</p>
-            {Math.abs(simTime - selectedSat.epochMs) > ELEMENT_AGE_LIMIT_MS && <p className="notice">Displayed time is more than 3.5 days from the elements. This extrapolation may be inaccurate.</p>}</div> : <p className="notice">Synthetic circular orbit. This object does not represent a current real-world position.</p>}
+          <div className="data-detail"><p>Element epoch <time>{utc(selectedSat.epochMs)}</time></p><p>Last successful fetch <time>{selectedGroup.fetchedAt === null ? 'Unknown' : utc(selectedGroup.fetchedAt)}</time></p><p>{deliveryStatus(selectedGroup)}</p>
+            {Math.abs(simTime - selectedSat.epochMs) > ELEMENT_AGE_LIMIT_MS && <p className="notice">Displayed time is more than 3.5 days from the elements. This extrapolation may be inaccurate.</p>}</div>
           {display.groundTrack && <p className="muted"><span className="track-key" /> Ground track: surface path over the next orbit.</p>}
           <PassPlanner key={`${selection.key}:${selection.id}:${selectedGroup.fetchedAt}`} sat={selectedSat} getTime={() => engine.current?.getTime() ?? simTime} onJump={jump} />
         </div>}
@@ -278,7 +281,7 @@ export default function App() {
           <label className="check-label"><input type="checkbox" checked={display.guides} onChange={e => setDisplay(d => ({ ...d, guides: e.target.checked }))} /> Equator & altitude guides</label>
           {display.guides && <ul className="guide-legend"><li style={{ color: '#5eead4' }}>Equator · surface</li><li style={{ color: '#38bdf8' }}>LEO upper boundary · 2,000 km</li><li style={{ color: '#facc15' }}>GPS reference · 20,180 km</li><li style={{ color: '#c4b5fd' }}>GEO reference · 35,786 km</li><li className="muted">Equatorial reference rings; zoom out to see higher orbits.</li></ul>}
         </details>
-        <details className="data-help"><summary>About the data</summary><p>Fresh elements: epoch within 3.5 days of now. Stale elements: epoch outside that range. Mixed elements: a group contains both. The summary counts individual satellites. Fetch age and failed refreshes are shown separately; fetching an old orbit again does not make its elements fresh. These are display thresholds, not accuracy guarantees.</p><p>Simulation time is separate from data freshness. Synthetic groups are always marked Simulated.</p><p>Coordinates use a geodetic Earth model; the globe and guides use a mean-radius sphere. Speeds are relative to an Earth-centered inertial frame.</p><p><a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">CelesTrak OMM data</a> · SGP4 propagation</p>{groups.some(g => g.rejectedCount) && <p>{groups.reduce((n, g) => n + g.rejectedCount, 0)} invalid or duplicate records excluded.</p>}</details>
+        <details className="data-help"><summary>About the data</summary><p>Fresh elements: epoch within 3.5 days of now. Stale elements: epoch outside that range. Mixed elements: a group contains both. The summary counts individual satellites. Fetch age and failed refreshes are shown separately; fetching an old orbit again does not make its elements fresh. These are display thresholds, not accuracy guarantees.</p><p>Simulation time is separate from data freshness.</p><p>Coordinates use a geodetic Earth model; the globe and guides use a mean-radius sphere. Speeds are relative to an Earth-centered inertial frame.</p><p><a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">CelesTrak OMM data</a> · SGP4 propagation</p>{groups.some(g => g.rejectedCount) && <p>{groups.reduce((n, g) => n + g.rejectedCount, 0)} invalid or duplicate records excluded.</p>}</details>
       </div>}
     </aside>
 

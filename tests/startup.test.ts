@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { parseOmmCsv } from '../shared/csv';
-import { ACTIVE_SOURCE, readSnapshot, SNAPSHOT_MAX_AGE_MS, SNAPSHOT_PATH } from '../shared/snapshot';
+import { ACTIVE_SOURCE, readSnapshot, SNAPSHOT_PATH } from '../shared/snapshot';
 import { GROUP_DEFS, loadGroup, parseOmm, eciState, SNAPSHOT_HEAD_START_MS, type LoadedGroup } from '../src/satellites';
 import { issOmm, ommCsv } from './fixtures';
 
@@ -32,7 +32,7 @@ test('first visitor sees observed satellites before a stalled API, without brows
   const pending = loadGroup(active, undefined, displayed);
   t.mock.timers.tick(SNAPSHOT_HEAD_START_MS);
   const group = await visible;
-  assert.equal(group.sats[0].kind, 'sgp4');
+  assert.ok(group.sats[0].satrec);
   assert.equal(group.fetchedAt, Date.parse(fetchedAt));
   assert.equal(group.catalogSnapshot, true);
   finish(new Response('unavailable', { status: 503, headers: { 'Retry-After': '7200' } }));
@@ -178,12 +178,6 @@ test('a hanging browser cache cannot hold up the API indefinitely', async t => {
   const pending = loadGroup(active, undefined, () => {});
   t.mock.timers.tick(501);
   assert.equal((await pending).sats.length, 1);
-});
-
-test('the shipped startup asset is refreshed well before it expires', async () => {
-  const { fetchedAt: saved } = JSON.parse(await readFile('public/data/active.json', 'utf8'));
-  const remainingDays = (Date.parse(saved) + SNAPSHOT_MAX_AGE_MS - Date.now()) / 86400000;
-  assert.ok(remainingDays > 7, `The startup catalog expires in ${remainingDays.toFixed(1)} days. Run npm run snapshot:update and deploy.`);
 });
 
 test('CSV preserves extended IDs, quoted names, column order and SGP4 propagation', () => {

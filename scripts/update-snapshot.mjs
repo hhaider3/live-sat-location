@@ -1,6 +1,8 @@
 // Updates the site-hosted startup catalog atomically. Builds remain offline.
 import { build } from 'esbuild';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const bundled = await build({ stdin: { contents: `
   export * from './shared/snapshot.ts';
@@ -9,7 +11,10 @@ const bundled = await build({ stdin: { contents: `
 `, resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node' });
 const { readSnapshot, ACTIVE_SOURCE, fetchMirrorSnapshot, parseOmmCsv } = await import(
   `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
-const target = new URL('../public/data/active.json', import.meta.url);
+// A deploy refreshes its build output, which leaves the tracked copy untouched.
+const targetFlag = process.argv.indexOf('--target');
+const target = targetFlag > 0 ? pathToFileURL(resolve(process.argv[targetFlag + 1]))
+  : new URL('../public/data/active.json', import.meta.url);
 let previous;
 try { previous = readSnapshot(JSON.parse(await readFile(target, 'utf8'))); } catch { /* first snapshot */ }
 if (previous && Date.now() - Date.parse(previous.fetchedAt) < 2 * 3600000) {
@@ -38,7 +43,7 @@ if (previous && Date.parse(snapshot.fetchedAt) < Date.parse(previous.fetchedAt))
   if (previous && snapshot.records.length < previous.records.length * 0.8) {
     throw new Error('Refusing to replace the snapshot after an unexpected catalog count drop');
   }
-  await mkdir(new URL('../public/data/', import.meta.url), { recursive: true });
+  await mkdir(new URL('./', target), { recursive: true });
   const temporary = new URL(`${target.href}.tmp`);
   await writeFile(temporary, JSON.stringify(snapshot) + '\n');
   await rename(temporary, target);

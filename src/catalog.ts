@@ -18,7 +18,7 @@ export const CATALOG_REQUESTS = GROUP_DEFS.filter(def => !(def.key in constellat
 export function activeCatalog(sources: LoadedGroup[], previous: LoadedGroup[] = []): LoadedGroup[] {
   const active = sources.find(g => g.key === 'active');
   if (!active) return [];
-  const remaining = new Map(active.sats.filter(s => s.kind === 'sgp4').map(s => [s.id, s]));
+  const remaining = new Map(active.sats.map(s => [s.id, s]));
   const groups = GROUP_DEFS.map(def => {
     const sats: Sat[] = [];
     const membership = sources.find(g => g.key === def.key);
@@ -27,7 +27,6 @@ export function activeCatalog(sources: LoadedGroup[], previous: LoadedGroup[] = 
       remaining.clear();
     } else {
       for (const member of membership?.sats ?? []) {
-        if (member.kind !== 'sgp4') continue;
         const sat = remaining.get(member.id);
         if (sat) { sats.push(sat); remaining.delete(member.id); }
       }
@@ -46,6 +45,19 @@ export function activeCatalog(sources: LoadedGroup[], previous: LoadedGroup[] = 
       rejectedCount: def.key === 'active' ? active.rejectedCount : 0 };
   });
   return groups.sort((a, b) => b.sats.length - a.sats.length || a.label.localeCompare(b.label));
+}
+
+// Longer than the Worker's 45-second refresh lock, so each poll can see a new result.
+const REVALIDATE_POLL_MS = 60000;
+
+/** Each request downloads and parses a whole group, so repeats must be earned. */
+export function isRefreshDue(previous: LoadedGroup | undefined, lastAttempt: number, now: number, force = false): boolean {
+  if (force || !previous) return true;
+  if (previous.retryAt) return now >= previous.retryAt;
+  const sinceAttempt = now - lastAttempt;
+  if (previous.refreshState === 'revalidating') return sinceAttempt >= REVALIDATE_POLL_MS;
+  return sinceAttempt >= 5 * 60000 &&
+    (previous.servedStale || previous.fetchedAt === null || now - previous.fetchedAt >= 2 * 3600000);
 }
 
 /** Bound upstream bursts while letting each completed group publish immediately. */

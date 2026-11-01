@@ -4,18 +4,7 @@ import { readSnapshot, SNAPSHOT_PATH } from '../shared/snapshot';
 
 // ---------- Types ----------
 
-export type Sat =
-  | { kind: "sgp4"; id: string; name: string; epochMs: number; satrec: satlib.SatRec }
-  | {
-      kind: "kepler";
-      id: string;
-      name: string;
-      radiusKm: number;
-      inc: number; // rad
-      raan: number; // rad
-      m0: number; // rad at epoch
-      n: number; // rad / sec
-    };
+export interface Sat { id: string; name: string; epochMs: number; satrec: satlib.SatRec }
 
 export interface GroupDef {
   key: string;
@@ -23,7 +12,6 @@ export interface GroupDef {
   color: string; // hex
   url: string;
   legacyUrl: string;
-  fallback: () => Sat[];
 }
 
 export interface LoadedGroup extends GroupDef {
@@ -38,39 +26,20 @@ export interface LoadedGroup extends GroupDef {
   retryAt?: number;
 }
 
-const KEPLER_EPOCH_MS = Date.UTC(2024, 0, 1);
-const MU = 398600.4418; // km^3/s^2
 export const R_EARTH = 6371; // km
 
 // ---------- Position propagation ----------
 
-const scratch = { x: 0, y: 0, z: 0 };
-
 /** Returns ECI position in km, or null if propagation failed. */
 export function eciPosition(sat: Sat, date: Date): { x: number; y: number; z: number } | null {
-  if (sat.kind === "sgp4") {
-    try {
-      const pv = satlib.propagate(sat.satrec, date);
-      const p = pv?.position;
-      if (!p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite)) return null;
-      return p;
-    } catch {
-      return null;
-    }
+  try {
+    const pv = satlib.propagate(sat.satrec, date);
+    const p = pv?.position;
+    if (!p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite)) return null;
+    return p;
+  } catch {
+    return null;
   }
-  // Simple circular Keplerian orbit
-  const t = (date.getTime() - KEPLER_EPOCH_MS) / 1000;
-  const u = sat.m0 + sat.n * t;
-  const cu = Math.cos(u);
-  const su = Math.sin(u);
-  const cO = Math.cos(sat.raan);
-  const sO = Math.sin(sat.raan);
-  const ci = Math.cos(sat.inc);
-  const si = Math.sin(sat.inc);
-  scratch.x = sat.radiusKm * (cO * cu - sO * su * ci);
-  scratch.y = sat.radiusKm * (sO * cu + cO * su * ci);
-  scratch.z = sat.radiusKm * (su * si);
-  return scratch;
 }
 
 export interface EciState {
@@ -88,47 +57,25 @@ export interface EciState {
  * per-frame batch loop.
  */
 export function eciState(sat: Sat, date: Date): EciState | null {
-  if (sat.kind === "sgp4") {
-    try {
-      const pv = satlib.propagate(sat.satrec, date);
-      const p = pv?.position;
-      const v = pv?.velocity;
-      if (
-        !p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite) ||
-        !v || typeof v === "boolean" || ![v.x, v.y, v.z].every(Number.isFinite)
-      ) {
-        return null;
-      }
-      return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
-    } catch {
+  try {
+    const pv = satlib.propagate(sat.satrec, date);
+    const p = pv?.position;
+    const v = pv?.velocity;
+    if (
+      !p || typeof p === "boolean" || ![p.x, p.y, p.z].every(Number.isFinite) ||
+      !v || typeof v === "boolean" || ![v.x, v.y, v.z].every(Number.isFinite)
+    ) {
       return null;
     }
+    return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
+  } catch {
+    return null;
   }
-  // Circular Keplerian orbit: v = (dp/du) * n
-  const t = (date.getTime() - KEPLER_EPOCH_MS) / 1000;
-  const u = sat.m0 + sat.n * t;
-  const cu = Math.cos(u);
-  const su = Math.sin(u);
-  const cO = Math.cos(sat.raan);
-  const sO = Math.sin(sat.raan);
-  const ci = Math.cos(sat.inc);
-  const si = Math.sin(sat.inc);
-  const R = sat.radiusKm;
-  const rn = R * sat.n;
-  return {
-    x: R * (cO * cu - sO * su * ci),
-    y: R * (sO * cu + cO * su * ci),
-    z: R * (su * si),
-    vx: rn * (-cO * su - sO * cu * ci),
-    vy: rn * (-sO * su + cO * cu * ci),
-    vz: rn * (cu * si),
-  };
 }
 
 /** Orbital period in minutes, for sampling an orbit path. */
 export function orbitPeriodMin(sat: Sat): number {
-  if (sat.kind === "sgp4") return (2 * Math.PI) / sat.satrec.no; // satrec.no is rad/min
-  return (2 * Math.PI) / sat.n / 60;
+  return (2 * Math.PI) / sat.satrec.no; // satrec.no is rad/min
 }
 
 /**
@@ -141,22 +88,6 @@ export function sampleOrbitPath(
   samples: number,
   out: Float32Array
 ): boolean {
-  if (sat.kind === "kepler") {
-    const cO = Math.cos(sat.raan);
-    const sO = Math.sin(sat.raan);
-    const ci = Math.cos(sat.inc);
-    const si = Math.sin(sat.inc);
-    const R = sat.radiusKm;
-    for (let k = 0; k < samples; k++) {
-      const u = (k / samples) * 2 * Math.PI;
-      const cu = Math.cos(u);
-      const su = Math.sin(u);
-      out[k * 3] = R * (cO * cu - sO * su * ci);
-      out[k * 3 + 1] = R * (sO * cu + cO * su * ci);
-      out[k * 3 + 2] = R * (su * si);
-    }
-    return true;
-  }
   const periodMin = orbitPeriodMin(sat);
   const t0 = date.getTime();
   for (let k = 0; k < samples; k++) {
@@ -169,60 +100,6 @@ export function sampleOrbitPath(
   return true;
 }
 
-// ---------- Synthetic constellation generators (offline fallback) ----------
-
-function meanMotion(radiusKm: number): number {
-  return Math.sqrt(MU / (radiusKm * radiusKm * radiusKm)); // rad/s
-}
-
-function walker(
-  namePrefix: string,
-  planes: number,
-  perPlane: number,
-  altKm: number,
-  incDeg: number,
-  phaseF = 1
-): Sat[] {
-  const sats: Sat[] = [];
-  const r = R_EARTH + altKm;
-  const n = meanMotion(r);
-  const inc = (incDeg * Math.PI) / 180;
-  for (let p = 0; p < planes; p++) {
-    const raan = (2 * Math.PI * p) / planes;
-    for (let s = 0; s < perPlane; s++) {
-      const m0 =
-        (2 * Math.PI * s) / perPlane + (2 * Math.PI * phaseF * p) / (planes * perPlane);
-      sats.push({ kind: "kepler", id: `sim:${namePrefix}-${p + 1}-${s + 1}`, name: `${namePrefix}-${p + 1}-${s + 1}`, radiusKm: r, inc, raan, m0, n });
-    }
-  }
-  return sats;
-}
-
-const fallbackStarlink = (): Sat[] => [
-  ...walker("STARLINK-A", 72, 22, 550, 53),
-  ...walker("STARLINK-B", 72, 22, 540, 53.2, 17),
-  ...walker("STARLINK-C", 36, 20, 570, 70, 9),
-  ...walker("STARLINK-D", 6, 58, 560, 97.6, 3),
-  ...walker("STARLINK-E", 28, 30, 525, 43, 11),
-];
-const fallbackOneWeb = () => walker("ONEWEB", 12, 49, 1200, 87.4);
-const fallbackGps = () => walker("GPS", 6, 5, 20180, 55);
-const fallbackGlonass = () => walker("GLONASS", 3, 8, 19130, 64.8);
-const fallbackGalileo = () => walker("GALILEO", 3, 8, 23222, 56);
-const fallbackBeidou = () => [...walker("BEIDOU-M", 3, 8, 21528, 55), ...walker("BEIDOU-G", 1, 6, 35786, 1)];
-const fallbackIridium = () => walker("IRIDIUM", 6, 11, 780, 86.4);
-const fallbackStations = (): Sat[] => [
-  ...walker("ISS", 1, 1, 420, 51.6),
-  ...walker("CSS-TIANHE", 1, 1, 390, 41.5),
-];
-const fallbackGeo = () => walker("GEOSAT", 1, 140, 35786, 0.5);
-const fallbackOther = (): Sat[] => [
-  ...walker("NOAA", 1, 5, 850, 98.7),
-  ...walker("SENTINEL", 1, 6, 700, 98.2),
-  ...walker("CUBESAT", 8, 12, 500, 97.4, 5),
-  ...walker("MOLNIYA", 2, 2, 26560, 63.4),
-];
-
 // ---------- Group catalogue ----------
 
 const CT = (group: string) =>
@@ -231,39 +108,37 @@ const LEGACY_CT = (group: string) =>
   `/api/tle?group=${encodeURIComponent(group)}`;
 
 export const GROUP_DEFS: GroupDef[] = [
-  { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), legacyUrl: LEGACY_CT("starlink"), fallback: fallbackStarlink },
-  { key: "oneweb", label: "OneWeb", color: "#a78bfa", url: CT("oneweb"), legacyUrl: LEGACY_CT("oneweb"), fallback: fallbackOneWeb },
-  { key: "gps", label: "GPS", color: "#facc15", url: CT("gps-ops"), legacyUrl: LEGACY_CT("gps-ops"), fallback: fallbackGps },
-  { key: "glonass", label: "GLONASS", color: "#fb923c", url: CT("glo-ops"), legacyUrl: LEGACY_CT("glo-ops"), fallback: fallbackGlonass },
-  { key: "galileo", label: "Galileo", color: "#34d399", url: CT("galileo"), legacyUrl: LEGACY_CT("galileo"), fallback: fallbackGalileo },
-  { key: "beidou", label: "BeiDou", color: "#f472b6", url: CT("beidou"), legacyUrl: LEGACY_CT("beidou"), fallback: fallbackBeidou },
-  { key: "iridium", label: "Iridium NEXT", color: "#e879f9", url: CT("iridium-NEXT"), legacyUrl: LEGACY_CT("iridium-NEXT"), fallback: fallbackIridium },
-  { key: "stations", label: "Space Stations", color: "#ef4444", url: CT("stations"), legacyUrl: LEGACY_CT("stations"), fallback: fallbackStations },
-  { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), legacyUrl: LEGACY_CT("geo"), fallback: fallbackGeo },
-  { key: "science", label: "Science / Weather", color: "#4ade80", url: CT("science"), legacyUrl: LEGACY_CT("science"), fallback: fallbackOther },
-  { key: "kuiper", label: "Amazon Leo (Kuiper)", color: "#f59e0b", url: CT("kuiper"), legacyUrl: LEGACY_CT("kuiper"), fallback: () => [] },
-  { key: "active", label: "Other active satellites", color: "#94a3b8", url: CT("active"), legacyUrl: '', fallback: () => [] },
+  { key: "starlink", label: "Starlink", color: "#38bdf8", url: CT("starlink"), legacyUrl: LEGACY_CT("starlink") },
+  { key: "oneweb", label: "OneWeb", color: "#a78bfa", url: CT("oneweb"), legacyUrl: LEGACY_CT("oneweb") },
+  { key: "gps", label: "GPS", color: "#facc15", url: CT("gps-ops"), legacyUrl: LEGACY_CT("gps-ops") },
+  { key: "glonass", label: "GLONASS", color: "#fb923c", url: CT("glo-ops"), legacyUrl: LEGACY_CT("glo-ops") },
+  { key: "galileo", label: "Galileo", color: "#34d399", url: CT("galileo"), legacyUrl: LEGACY_CT("galileo") },
+  { key: "beidou", label: "BeiDou", color: "#f472b6", url: CT("beidou"), legacyUrl: LEGACY_CT("beidou") },
+  { key: "iridium", label: "Iridium NEXT", color: "#e879f9", url: CT("iridium-NEXT"), legacyUrl: LEGACY_CT("iridium-NEXT") },
+  { key: "stations", label: "Space Stations", color: "#ef4444", url: CT("stations"), legacyUrl: LEGACY_CT("stations") },
+  { key: "weather", label: "Weather", color: "#2dd4bf", url: CT("weather"), legacyUrl: LEGACY_CT("weather") },
+  { key: "geo", label: "Geostationary", color: "#f8fafc", url: CT("geo"), legacyUrl: LEGACY_CT("geo") },
+  { key: "science", label: "Science", color: "#4ade80", url: CT("science"), legacyUrl: LEGACY_CT("science") },
+  { key: "kuiper", label: "Amazon Leo (Kuiper)", color: "#f59e0b", url: CT("kuiper"), legacyUrl: LEGACY_CT("kuiper") },
+  { key: "active", label: "Other active satellites", color: "#94a3b8", url: CT("active"), legacyUrl: '' },
 ];
 
 // ---------- Validated OMM data and freshness ----------
 
-export type Freshness = "Fresh" | "Stale" | "Mixed" | "Simulated" | "Unavailable";
+export type Freshness = "Fresh" | "Stale" | "Mixed" | "Unavailable";
 export const ELEMENT_AGE_LIMIT_MS = 3.5 * 86400000;
 
 export function dataFreshness(group: LoadedGroup, now = Date.now(), sat?: Sat): Freshness {
   if (!sat && !group.sats.length) return 'Unavailable';
-  const real = sat ? sat.kind === "sgp4" : group.sats.some(s => s.kind === "sgp4");
-  if (!real) return "Simulated";
-  const epochs = sat?.kind === "sgp4" ? [sat.epochMs]
-    : group.sats.flatMap(s => s.kind === "sgp4" ? [s.epochMs] : []);
+  const epochs = sat ? [sat.epochMs] : group.sats.map(s => s.epochMs);
   // Element age and delivery/cache age are independent. Missing HTTP metadata
-  // must not turn recent observed elements into stale or synthetic data.
+  // must not turn recent observed elements into stale data.
   const old = epochs.filter(epoch => !Number.isFinite(epoch) || Math.abs(now - epoch) > ELEMENT_AGE_LIMIT_MS).length;
   return old === epochs.length ? "Stale" : old > 0 ? "Mixed" : "Fresh";
 }
 
 export function deliveryStatus(group: LoadedGroup, now = Date.now()): string {
-  if (!group.sats.some(s => s.kind === 'sgp4')) return group.error ?? 'Observed data unavailable';
+  if (!group.sats.length) return group.error ?? 'Observed data unavailable';
   if (group.catalogSnapshot) return group.refreshState === 'revalidating'
     ? 'Saved catalog; checking for updates' : 'Using saved catalog; live refresh pending';
   if (group.refreshState === 'revalidating') return 'Cached observations; refreshing in background';
@@ -285,7 +160,7 @@ export function parseOmm(data: unknown): { sats: Sat[]; rejectedCount: number } 
     try {
       const epochMs = epochMillis(normalized.EPOCH);
       const satrec = satlib.json2satrec({ ...normalized, EPOCH: new Date(epochMs).toISOString() });
-      const sat: Sat = { kind: "sgp4", id,
+      const sat: Sat = { id,
         name: typeof normalized.OBJECT_NAME === "string" && normalized.OBJECT_NAME.trim()
           ? normalized.OBJECT_NAME.trim() : `NORAD ${id}`, epochMs, satrec };
       // The parser can return an unusable record without throwing.
@@ -319,7 +194,7 @@ export const SNAPSHOT_HEAD_START_MS = 2500;
 const MAX_RETRY_SECONDS = 300;
 
 // Persist only observed OMM responses. Storage denial/eviction is harmless;
-// neither synthetic fallback nor a failed request can overwrite this copy.
+// a failed request cannot overwrite this copy.
 async function savedResponse(def: GroupDef): Promise<Response | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -419,7 +294,7 @@ async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
         const seconds = Number(res.headers.get('Retry-After'));
         const retryAt = Date.now() + Math.min(Number.isFinite(seconds) ? seconds : 60, MAX_RETRY_SECONDS) * 1000;
         return saved ? { ...saved, refreshState: 'failed', retryAt }
-          : { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
+          : { ...def, sats: [], fetchedAt: null, servedStale: false,
             rejectedCount: 0, error: 'Orbital source unavailable; retry scheduled', retryAt };
       }
       if (!res.ok) throw new Error(`OMM request failed (${res.status})`);
@@ -460,7 +335,7 @@ async function loadObservedGroup(def: GroupDef, signal?: AbortSignal,
   } catch (error) {
     if (signal?.aborted) throw error;
     if (saved) return { ...saved, refreshState: 'failed', error: error instanceof Error ? error.message : 'Data unavailable' };
-    return { ...def, sats: def.fallback(), fetchedAt: null, servedStale: false,
+    return { ...def, sats: [], fetchedAt: null, servedStale: false,
       rejectedCount: 0, error: error instanceof Error ? error.message : "Data unavailable" };
   } finally {
     clearTimeout(timer);
@@ -479,7 +354,7 @@ function parseTle(text: string): Sat[] {
       const satrec = satlib.twoline2satrec(lines[i], lines[i + 1]);
       const id = String(satrec.satnum);
       const epochMs = (satrec.jdsatepoch - 2440587.5) * 86400000;
-      const sat: Sat = { kind: 'sgp4', id, name, epochMs, satrec };
+      const sat: Sat = { id, name, epochMs, satrec };
       if (Number.isFinite(epochMs) && Number.isFinite(satrec.no) && satrec.no > 0 &&
           eciState(sat, new Date(epochMs))) sats.push(sat);
     } catch { /* skip malformed legacy element sets */ }

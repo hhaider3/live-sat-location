@@ -24,6 +24,20 @@ export function samplePositions(sats: Sat[], ms: number): Float32Array {
   return out;
 }
 
+interface DrawnGroup { sats: Sat[]; positions: Float32Array }
+
+/** A rebuilt group keeps each satellite's last drawn position until its next
+ * snapshot arrives, so regrouping or replacing the catalog cannot make dots blink.
+ */
+export function carryPositions(sats: Sat[], drawn: readonly DrawnGroup[], out: Float32Array) {
+  const known = new Map<string, { positions: Float32Array; offset: number }>();
+  for (const group of drawn) group.sats.forEach((sat, i) => known.set(sat.id, { positions: group.positions, offset: i * 3 }));
+  sats.forEach((sat, i) => {
+    const previous = known.get(sat.id);
+    if (previous) out.set(previous.positions.subarray(previous.offset, previous.offset + 3), i * 3);
+  });
+}
+
 /** Every group and every object is evaluated at the same two timestamps. */
 export function buildSnapshot(groups: Map<string, Sat[]>, request: Extract<PropagationRequest, { type: 'sample' }>): Snapshot {
   return { generation: request.generation, start: request.start, end: request.end,
@@ -31,6 +45,24 @@ export function buildSnapshot(groups: Map<string, Sat[]>, request: Extract<Propa
       const sats = groups.get(key);
       return sats ? [{ key, a: samplePositions(sats, request.start), b: samplePositions(sats, request.end) }] : [];
     }) };
+}
+
+/** How far each snapshot reaches, in simulated milliseconds. Capped to limit
+ * straight-line interpolation error across an orbital arc.
+ */
+export function snapshotStep(speed: number): number {
+  return Math.sign(speed) * Math.min(30000, Math.max(1000, Math.abs(speed) * 120));
+}
+
+/** Real milliseconds between snapshot requests. Each snapshot already covers its
+ * whole span, so the next only has to arrive before it runs out. Slow devices
+ * get a larger margin, and fast playback keeps the responsive minimum.
+ */
+export function snapshotInterval(speed: number, latencyMs: number): number {
+  const magnitude = Math.abs(speed);
+  const responsive = Math.max(16, Math.min(100, 10000 / Math.max(1, magnitude)));
+  const span = Math.abs(snapshotStep(speed)) / magnitude;
+  return Math.max(responsive, span - 2 * latencyMs - 50);
 }
 
 export function snapshotTime(snapshot: Snapshot, desired: number): number {

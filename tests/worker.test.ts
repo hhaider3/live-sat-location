@@ -315,7 +315,7 @@ test('the scheduled refresh stores every requested group and keeps going past a 
     return new Response(ommCsv(group === 'active' ? activeRecords : [issOmm]));
   });
   await assert.rejects(worker.scheduled({}, { CATALOG }), /gps-ops: http-429/);
-  assert.equal(CATALOG.puts.length, 8);
+  assert.equal(CATALOG.puts.length, 9);
   assert.equal(CATALOG.data.get('omm:gps-ops')!.metadata.fetchedAt, fetchedAt);
   assert.equal(CATALOG.data.get('omm:active')!.metadata.count, 10000);
   assert.equal(JSON.parse(CATALOG.data.get('omm:stations')!.value)[0].NORAD_CAT_ID, 25544);
@@ -323,14 +323,15 @@ test('the scheduled refresh stores every requested group and keeps going past a 
 
 test('the scheduled refresh rejects a shrunken active feed and falls back to the verified mirror', async t => {
   const records = Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
-  const body = JSON.stringify(records);
+  const complete = Array.from({ length: 18000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
+  const body = JSON.stringify(complete);
   const mirrored = new Date(Date.now() - 60000).toISOString();
   const previous = new Date(Date.now() - 3 * 3600000).toISOString();
   const CATALOG = storedCatalogs({ 'omm:active': { value: '[]', metadata: { fetchedAt: previous, count: 20000, rejected: 0 } } });
   t.mock.method(console, 'warn', () => {});
   t.mock.method(globalThis, 'fetch', async (input: URL | string) => {
     if (String(input) === MIRROR_STATUS) return Response.json({ dataset: 'active', query: 'GROUP', value: 'active',
-      last_success: mirrored, record_count: records.length, sha256: createHash('sha256').update(body).digest('hex') });
+      last_success: mirrored, record_count: complete.length, sha256: createHash('sha256').update(body).digest('hex') });
     if (String(input) === MIRROR_SOURCE) return new Response(body);
     return new Response(ommCsv((input as URL).searchParams.get('GROUP') === 'active' ? records : [issOmm]));
   });
@@ -338,4 +339,33 @@ test('the scheduled refresh rejects a shrunken active feed and falls back to the
   const saved = CATALOG.data.get('omm:active')!;
   assert.equal(saved.metadata.fetchedAt, mirrored);
   assert.equal(saved.metadata.source, MIRROR_SOURCE);
+});
+
+test('the mirror cannot shrink the stored catalog', async t => {
+  const records = Array.from({ length: 10000 }, (_, i) => ({ ...issOmm, NORAD_CAT_ID: i + 1 }));
+  const body = JSON.stringify(records);
+  const previous = new Date(Date.now() - 3 * 3600000).toISOString();
+  const CATALOG = storedCatalogs({ 'omm:active': { value: '[]', metadata: { fetchedAt: previous, count: 20000, rejected: 0 } } });
+  t.mock.method(globalThis, 'fetch', async (input: URL | string) => {
+    if (String(input) === MIRROR_STATUS) return Response.json({ dataset: 'active', query: 'GROUP', value: 'active',
+      last_success: new Date().toISOString(), record_count: records.length, sha256: createHash('sha256').update(body).digest('hex') });
+    if (String(input) === MIRROR_SOURCE) return new Response(body);
+    return new Response(ommCsv((input as URL).searchParams.get('GROUP') === 'active' ? records : [issOmm]));
+  });
+  await assert.rejects(refreshStoredCatalogs({ CATALOG }), /active: invalid-data/);
+  assert.equal(CATALOG.data.get('omm:active')!.metadata.fetchedAt, previous);
+});
+
+test('HEAD returns the same status and headers without a body', async t => {
+  const { store, ctx } = setup(t);
+  const fetched = new Date().toISOString();
+  store.set(url.href, new Response(JSON.stringify([issOmm]), { headers: { 'X-Fetched-At': fetched } }));
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not fetch'); });
+  const response = await worker.fetch(new Request(url, { method: 'HEAD' }), {}, ctx);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('X-Fetched-At'), fetched);
+  assert.equal(await response.text(), '');
+  const denied = await worker.fetch(new Request(url, { method: 'DELETE' }), {}, ctx);
+  assert.equal(denied.status, 405);
+  assert.equal(denied.headers.get('Allow'), 'GET, HEAD');
 });

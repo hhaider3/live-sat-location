@@ -14,7 +14,7 @@ import {
 } from "./satellites";
 
 import PropagationWorker from './propagation.worker?worker&inline';
-import { buildSnapshot, interpolatePositions, snapshotTime, type PropagationRequest, type Snapshot } from './propagation';
+import { buildSnapshot, carryPositions, interpolatePositions, snapshotInterval, snapshotStep, snapshotTime, type PropagationRequest, type Snapshot } from './propagation';
 import { SimulationClock } from './time';
 import { pickSatellite, SatelliteTapGesture } from './picking';
 
@@ -194,7 +194,7 @@ export function createEngine(
     if (earthTextureRequested || disposed) return;
     earthTextureRequested = true;
     earthTextures.add(new THREE.TextureLoader().load(
-      "https://unpkg.com/three-globe@2.31.0/example/img/earth-blue-marble.jpg",
+      "/assets/earth-blue-marble.jpg",
       (tex) => {
         if (disposed) return;
         tex.colorSpace = THREE.SRGBColorSpace;
@@ -276,6 +276,7 @@ export function createEngine(
     if (disposed) return;
     const previous = selected ? { key: selected.g.key, id: selected.g.sats[selected.i].id, following } : null;
     let changed = false;
+    const drawn = [...groupRenders];
     for (const old of [...groupRenders]) {
       if (groups.some(g => g.key === old.key && g.sats === old.sats)) {
         old.data = groups.find(g => g.key === old.key)!;
@@ -291,6 +292,7 @@ export function createEngine(
     for (const g of groups) {
       if (groupRenders.some(old => old.key === g.key)) continue;
       const positions = new Float32Array(g.sats.length * 3).fill(HIDDEN);
+      carryPositions(g.sats, drawn, positions);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
       const baseSize = g.key === 'stations' ? 9 : g.key === 'starlink' ? 3.2 : 4.4;
@@ -322,11 +324,13 @@ export function createEngine(
   let generation = 0;
   let pending = false;
   let lastRequest = -Infinity;
+  let sampleLatency = 0; // how long the last snapshot took, so the next arrives in time
   let propagationWorker: Worker | null = null;
   try {
     propagationWorker = new PropagationWorker();
     propagationWorker.onmessage = (event: MessageEvent<Snapshot>) => {
       pending = false;
+      sampleLatency = performance.now() - lastRequest;
       if (!disposed && event.data.generation === generation) snapshot = event.data;
     };
     propagationWorker.onerror = () => {
@@ -343,8 +347,8 @@ export function createEngine(
   function updatePositions(now: number) {
     const desired = clock.time();
     const running = !clock.paused;
-    const step = running ? Math.sign(clock.speed) * Math.min(30000, Math.max(1000, Math.abs(clock.speed) * 120)) : 0;
-    const interval = Math.max(16, Math.min(100, 10000 / Math.max(1, Math.abs(clock.speed))));
+    const step = running ? snapshotStep(clock.speed) : 0;
+    const interval = snapshotInterval(clock.speed, sampleLatency);
     if (!pending && (!snapshot || (running && now - lastRequest >= interval))) {
       const request: Extract<PropagationRequest, { type: 'sample' }> = {
         type: 'sample', keys: groupRenders.filter(g => g.points.visible).map(g => g.key),
@@ -352,7 +356,10 @@ export function createEngine(
       };
       lastRequest = now;
       if (propagationWorker) { pending = true; propagationWorker.postMessage(request); }
-      else snapshot = buildSnapshot(new Map(groupRenders.map(g => [g.key, g.sats])), request);
+      else {
+        snapshot = buildSnapshot(new Map(groupRenders.map(g => [g.key, g.sats])), request);
+        sampleLatency = performance.now() - now;
+      }
     }
     if (!snapshot) {
       if (!groupRenders.length) simTime = desired;
@@ -518,7 +525,7 @@ export function createEngine(
       latitude: gd?.latitude ?? NaN,
       longitude: gd?.longitude ?? NaN,
       periodMin: orbitPeriodMin(sat),
-      inclination: (sat.kind === 'sgp4' ? sat.satrec.inclo : sat.inc) * 180 / Math.PI,
+      inclination: sat.satrec.inclo * 180 / Math.PI,
       following,
       altitudeKm: gd?.altitudeKm ?? NaN,
       velocityKmS: st ? Math.hypot(st.vx, st.vy, st.vz) : NaN,
