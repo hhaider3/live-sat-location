@@ -24,7 +24,7 @@
     "three": "^0.185.1"
   },
   "overrides": {
-    "sharp": "0.35.4"
+    "sharp": "0.35.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
